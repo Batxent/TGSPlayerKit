@@ -1,0 +1,38 @@
+Tests/TGSPlayerKitTests/DemoProjectScaffoldTests.swift
+  s_666489fa565d32::t_a8236d23f84df8 25-33
+Sources/TGSPlayerKit/TGSPlayerView.swift
+  s_666489fa565d32::t_a8236d23f84df8 240-244
+rlottie-tgs-player-design.md
+  h_78414b5f13c16c 1-370
+.gitignore
+  s_b3212577f9286f::t_bf10e4ba9a9f11 6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "7dc18fed7e37e58fe05e42ff94f683ea8f5062f1",
+  "prompts": {},
+  "humans": {
+    "h_78414b5f13c16c": {
+      "author": "tommy <batxent@me.com>"
+    }
+  },
+  "sessions": {
+    "s_666489fa565d32": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e253f-9805-7c12-aa83-db6b12737ac3",
+        "model": "gpt-5.5"
+      },
+      "human_author": "tommy <batxent@me.com>"
+    },
+    "s_b3212577f9286f": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e254c-eb11-7fa1-ab8f-070c5655b345",
+        "model": "gpt-5.5"
+      },
+      "human_author": "tommy <batxent@me.com>"
+    }
+  }
+}
