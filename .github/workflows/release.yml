@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "SemVer tag, for example 0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  binary-package:
+    name: Binary SwiftPM Release
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate version
+        run: |
+          VERSION="${{ inputs.version }}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Version must be SemVer without a leading v: $VERSION" >&2
+            exit 1
+          fi
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "Tag already exists: $VERSION" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build native rlottie artifact
+        run: scripts/build-rlottie-xcframework.sh
+
+      - name: Prepare binary package files
+        run: |
+          RELEASE_URL_BASE="https://github.com/${GITHUB_REPOSITORY}/releases/download/${VERSION}" scripts/prepare-binary-release.sh
+
+      - name: Create release manifest tag
+        run: |
+          cp .build/binary-release/Package.swift Package.swift
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Package.swift
+          git commit -m "release: TGSPlayerKit $VERSION"
+          git tag "$VERSION"
+          git push origin "refs/tags/$VERSION"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$VERSION" \
+            .build/binary-release/TGSPlayerKitRLottieNative.xcframework.zip \
+            --title "TGSPlayerKit $VERSION" \
+            --notes "SwiftPM binary release for TGSPlayerKitRLottie."

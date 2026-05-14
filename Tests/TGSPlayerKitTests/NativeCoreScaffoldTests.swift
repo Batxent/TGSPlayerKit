@@ -58,6 +58,22 @@ final class NativeCoreScaffoldTests: XCTestCase {
         XCTAssertTrue(releaseScript.contains("Package.rlottie-binary.swift.template"))
     }
 
+    func testGitHubReleasePublishesBinaryManifestForEndUsers() throws {
+        let root = packageRoot()
+        let workflow = try String(contentsOf: root.appendingPathComponent(".github/workflows/release.yml"))
+
+        XCTAssertTrue(workflow.contains("workflow_dispatch"))
+        XCTAssertTrue(workflow.contains("permissions:"))
+        XCTAssertTrue(workflow.contains("contents: write"))
+        XCTAssertTrue(workflow.contains("scripts/build-rlottie-xcframework.sh"))
+        XCTAssertTrue(workflow.contains("scripts/prepare-binary-release.sh"))
+        XCTAssertTrue(workflow.contains("cp .build/binary-release/Package.swift Package.swift"))
+        XCTAssertTrue(workflow.contains("git tag \"$VERSION\""))
+        XCTAssertTrue(workflow.contains("git push origin \"refs/tags/$VERSION\""))
+        XCTAssertTrue(workflow.contains("gh release create \"$VERSION\""))
+        XCTAssertTrue(workflow.contains("TGSPlayerKitRLottieNative.xcframework.zip"))
+    }
+
     func testRLottieSwiftAdapterBridgesNativeInstanceIntoLoaderProtocol() throws {
         let root = packageRoot()
         let adapter = try String(contentsOf: root.appendingPathComponent("Sources/TGSPlayerKitRLottie/TGSRLottieAnimationLoader.swift"))

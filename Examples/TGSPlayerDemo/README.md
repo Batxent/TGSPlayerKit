@@ -2,7 +2,9 @@
 
 UIKit demo app for local performance testing.
 
-Before opening the project, build the native backend:
+This project is for contributors working from a source checkout. End users should install the release product through SwiftPM and should not build `rlottie` themselves.
+
+Before opening the project, build the native backend from the repository root:
 
 ```bash
 RLOTTIE_SOURCE_DIR=/path/to/TelegramMessenger/rlottie scripts/build-rlottie-xcframework.sh

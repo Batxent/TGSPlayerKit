@@ -22,19 +22,21 @@ No global playback scheduler is used. Playback is view-local, timer-driven, and 
 
 ## Installation
 
-Add the package to an iOS project with Swift Package Manager:
+End users should integrate a GitHub Release tag. Release tags contain the binary SwiftPM manifest and download the prebuilt native `rlottie` xcframework from GitHub Releases.
 
 ```swift
 .package(url: "https://github.com/your-org/TGSPlayerKit.git", from: "0.1.0")
 ```
 
-Then add `TGSPlayerKit` to your app target.
+Then add `TGSPlayerKitRLottie` to your app target. Users should not run CMake, compile C++, or build `rlottie` manually.
+
+Source checkouts keep the default `Package.swift` core-only so tests and UIKit API work without native artifacts. Maintainers publish release tags with `Package.rlottie-binary.swift.template` through the release workflow.
 
 ## Demo
 
 The UIKit demo lives in `Examples/TGSPlayerDemo`. It links the local package plus the generated `TGSPlayerKitRLottieNative.xcframework`, then runs a 24 / 60 / 120 player stress grid with live FPS, visible-player count, frame callback throughput, and resident memory.
 
-Build the native backend first:
+Source contributors who run the demo locally need to build the native backend first:
 
 ```bash
 RLOTTIE_SOURCE_DIR=/path/to/TelegramMessenger/rlottie scripts/build-rlottie-xcframework.sh
