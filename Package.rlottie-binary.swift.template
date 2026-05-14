@@ -1,0 +1,41 @@
+// swift-tools-version: 5.9
+
+import PackageDescription
+
+let package = Package(
+    name: "TGSPlayerKit",
+    platforms: [
+        .iOS(.v13),
+        .macOS(.v12)
+    ],
+    products: [
+        .library(
+            name: "TGSPlayerKit",
+            targets: ["TGSPlayerKit"]
+        ),
+        .library(
+            name: "TGSPlayerKitRLottie",
+            targets: ["TGSPlayerKitRLottie"]
+        )
+    ],
+    targets: [
+        .target(name: "TGSPlayerKit"),
+        .target(
+            name: "TGSPlayerKitRLottie",
+            dependencies: [
+                "TGSPlayerKit",
+                "TGSPlayerKitRLottieNative"
+            ],
+            path: "Sources/TGSPlayerKitRLottie"
+        ),
+        .binaryTarget(
+            name: "TGSPlayerKitRLottieNative",
+            url: "__NATIVE_XCFRAMEWORK_URL__",
+            checksum: "__NATIVE_XCFRAMEWORK_CHECKSUM__"
+        ),
+        .testTarget(
+            name: "TGSPlayerKitTests",
+            dependencies: ["TGSPlayerKit"]
+        )
+    ]
+)

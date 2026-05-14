@@ -1,0 +1,12 @@
+.DS_Store
+.build/
+DerivedData/
+*.xcuserstate
+*.xcuserdata/
+**/*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.swiftpm/
+Package.resolved
+NativeCore/Artifacts/
+Vendor/rlottie/

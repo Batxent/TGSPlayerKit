@@ -1,0 +1,5 @@
+framework module TGSPlayerKitRLottieNative {
+    umbrella header "TGSLottieInstance.h"
+    export *
+    module * { export * }
+}
