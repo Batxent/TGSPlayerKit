@@ -1,0 +1,25 @@
+Tests/TGSPlayerKitTests/NativeCoreScaffoldTests.swift
+  s_48b2d41073f522::t_37aca4d27cb026 61-76
+README.md
+  s_48b2d41073f522::t_7bf111da9b996e 25,31-33,39
+.github/workflows/release.yml
+  s_48b2d41073f522::t_8e64252bd62a2d 1-60
+Examples/TGSPlayerDemo/README.md
+  s_48b2d41073f522::t_946a833bfec879 5-7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "2ae42783e1b67c8b8d82c75a7a1c7151071cd8eb",
+  "prompts": {},
+  "sessions": {
+    "s_48b2d41073f522": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019e21b0-0052-7a00-9628-571dbbfc8950",
+        "model": "gpt-5.5"
+      },
+      "human_author": "tommy <batxent@me.com>"
+    }
+  }
+}
