@@ -1,0 +1,52 @@
+Sources/TGSPlayerKit/TGSPlayerView.swift
+  s_123b764c7178cf::t_99983d52cc8169 121-122
+  s_123b764c7178cf::t_08fe164f5994ea 133
+  s_123b764c7178cf::t_cd3d1170ced885 160
+  s_123b764c7178cf::t_c85e8721f576b8 366-369
+  s_123b764c7178cf::t_0045ba1d7f0716 74-91,101-102
+  s_123b764c7178cf::t_e529dc989c8c69 385,387
+  s_123b764c7178cf::t_49d99f5d016778 390-427
+Sources/TGSPlayerKit/TGSStickerShimmerEffectView.swift
+  s_123b764c7178cf::t_b860470574d0d3 137-139,154
+  s_123b764c7178cf::t_3b09fcfa49281e 1-136,140-153,155-183
+Sources/TGSPlayerKit/TGSStickerSilhouette.swift
+  s_123b764c7178cf::t_9d0984653f415b 1-65
+Sources/TGSPlayerKit/TGSSVGPathParser.swift
+  s_123b764c7178cf::t_7d340e0000ab50 1-557
+Tests/TGSPlayerKitTests/TGSPlayerViewSilhouetteTests.swift
+  s_123b764c7178cf::t_82fe0448b53ae5 1-97
+Tests/TGSPlayerKitTests/TGSStickerShimmerEffectViewTests.swift
+  s_123b764c7178cf::t_1ef34a5f5f73b4 1-55
+README.md
+  s_123b764c7178cf::t_52ea4693e9c566 103-108,130-168
+  s_123b764c7178cf::t_2263f697782d97 194
+Examples/TGSPlayerDemo/TGSPlayerDemo/DemoViewController.swift
+  s_123b764c7178cf::t_3864c1c8bc9363 78-90,97
+  s_123b764c7178cf::t_5d8dfa1c2cebc1 293,301-302,307-311,313,330-384
+  s_123b764c7178cf::t_a424ffdfaa1e77 22-23,34-42
+  s_123b764c7178cf::t_f26c7832f8d790 233-243,247-249
+  s_123b764c7178cf::t_37e381a8f30648 171-177
+rlottie-tgs-player-design.md
+  s_123b764c7178cf::t_eacb5856e85cd9 379-383
+  s_123b764c7178cf::t_f5bdefa807dca6 249-294
+  s_123b764c7178cf::t_95ac5ee9a3929e 38-40
+Tests/TGSPlayerKitTests/TGSSVGPathParserTests.swift
+  s_123b764c7178cf::t_e72129b705e754 49
+  s_123b764c7178cf::t_44b8bb58adc8aa 1-48,50-144
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.8",
+  "base_commit_sha": "7cacbfb813d00358465b944a9b9bbecb04cf5cb9",
+  "prompts": {},
+  "sessions": {
+    "s_123b764c7178cf": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "d263d533-aa1b-41b4-95e7-c02cde764b54",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "tommy <batxent@me.com>"
+    }
+  }
+}
