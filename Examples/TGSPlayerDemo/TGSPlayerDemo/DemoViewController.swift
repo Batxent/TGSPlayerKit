@@ -19,6 +19,8 @@ final class DemoViewController: UIViewController {
     private let metricsView = PerformanceMetricsView()
     private let profileControl = UISegmentedControl(items: ["24", "60", "120"])
     private let pauseButton = UIButton(type: .system)
+    private let silhouetteSwitch = UISwitch()
+    private let silhouetteLabel = UILabel()
     private let layout = UICollectionViewFlowLayout()
     private lazy var collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
 
@@ -29,6 +31,15 @@ final class DemoViewController: UIViewController {
     private var frameCallbackCount: Int = 0
     private var selectedProfileIndex: Int = 1
     private var isPaused: Bool = false
+    private var silhouetteEnabled: Bool = true
+
+    private let silhouetteSVG = """
+    <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 512 512\">\
+    <path d=\"M 256 60 C 320 60 360 100 360 150 C 380 130 410 130 425 150 C 440 175 425 215 395 215 \
+    C 415 245 425 285 425 320 C 425 400 360 460 256 460 C 152 460 87 400 87 320 C 87 285 97 245 117 215 \
+    C 87 215 72 175 87 150 C 102 130 132 130 152 150 C 152 100 192 60 256 60 Z\"/>\
+    </svg>
+    """
 
     private var samplePath: String {
         guard let path = Bundle.main.path(forResource: "sample_pulse", ofType: "json") else {
@@ -64,13 +75,26 @@ final class DemoViewController: UIViewController {
         pauseButton.tintColor = .white
         pauseButton.addTarget(self, action: #selector(togglePause), for: .touchUpInside)
 
-        let controls = UIStackView(arrangedSubviews: [profileControl, pauseButton])
+        silhouetteLabel.text = "Silhouette"
+        silhouetteLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        silhouetteLabel.textColor = UIColor(white: 1.0, alpha: 0.86)
+        silhouetteSwitch.isOn = silhouetteEnabled
+        silhouetteSwitch.onTintColor = UIColor.systemBlue
+        silhouetteSwitch.addTarget(self, action: #selector(silhouetteToggled), for: .valueChanged)
+
+        let silhouetteStack = UIStackView(arrangedSubviews: [silhouetteLabel, silhouetteSwitch])
+        silhouetteStack.axis = .horizontal
+        silhouetteStack.spacing = 6
+        silhouetteStack.alignment = .center
+
+        let controls = UIStackView(arrangedSubviews: [profileControl, silhouetteStack, pauseButton])
         controls.axis = .horizontal
         controls.spacing = 12
         controls.alignment = .center
         controls.distribution = .fill
 
         profileControl.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        silhouetteStack.setContentHuggingPriority(.required, for: .horizontal)
         pauseButton.setContentHuggingPriority(.required, for: .horizontal)
 
         let header = UIStackView(arrangedSubviews: [metricsView, controls])
@@ -144,6 +168,13 @@ final class DemoViewController: UIViewController {
         restartVisiblePlayers()
     }
 
+    @objc private func silhouetteToggled() {
+        silhouetteEnabled = silhouetteSwitch.isOn
+        frameCallbackCount = 0
+        fpsSamples.removeAll(keepingCapacity: true)
+        collectionView.reloadData()
+    }
+
     @objc private func displayLinkDidTick(_ link: CADisplayLink) {
         if lastDisplayTimestamp > 0 {
             let delta = link.timestamp - lastDisplayTimestamp
@@ -199,10 +230,23 @@ extension DemoViewController: UICollectionViewDataSource, UICollectionViewDelega
             withReuseIdentifier: StickerCell.reuseIdentifier,
             for: indexPath
         ) as! StickerCell
+        let silhouette: TGSStickerSilhouette? = silhouetteEnabled
+            ? .svgData(
+                Data(silhouetteSVG.utf8),
+                style: TGSStickerShimmerStyle(
+                    foregroundColor: UIColor(white: 0, alpha: 0.10),
+                    shimmeringColor: UIColor(white: 1, alpha: 0.55),
+                    duration: 1.3
+                )
+            )
+            : nil
+        let simulatedDelay: TimeInterval = silhouetteEnabled ? 1.5 : 0
         cell.configure(
             path: samplePath,
             loader: animationLoader,
-            paused: isPaused
+            paused: isPaused,
+            silhouette: silhouette,
+            simulatedDelay: simulatedDelay
         ) { [weak self] in
             self?.frameCallbackCount += 1
         }
@@ -246,6 +290,7 @@ private final class StickerCell: UICollectionViewCell {
     override func prepareForReuse() {
         super.prepareForReuse()
         playerView.frameUpdated = { _, _ in }
+        playerView.silhouette = nil
         playerView.reset()
     }
 
@@ -253,12 +298,19 @@ private final class StickerCell: UICollectionViewCell {
         path: String,
         loader: TGSLottieAnimationLoading,
         paused: Bool,
+        silhouette: TGSStickerSilhouette?,
+        simulatedDelay: TimeInterval,
         onFrame: @escaping () -> Void
     ) {
         playerView.animationLoader = loader
         playerView.frameUpdated = { _, _ in onFrame() }
+        playerView.silhouette = silhouette
+        let baseSource = TGSAnimatedStickerLocalFileSource(path: path)
+        let source: TGSAnimatedStickerSource = simulatedDelay > 0
+            ? DelayedAnimatedStickerSource(base: baseSource, delay: simulatedDelay)
+            : baseSource
         playerView.setup(
-            source: TGSAnimatedStickerLocalFileSource(path: path),
+            source: source,
             width: 96,
             height: 96,
             playbackMode: .loop,
@@ -272,6 +324,64 @@ private final class StickerCell: UICollectionViewCell {
     func setPaused(_ paused: Bool) {
         playerView.visibility = !paused
         playerView.autoplay = !paused
+    }
+}
+
+private final class DelayedAnimatedStickerSource: TGSAnimatedStickerSource {
+    let isVideo: Bool
+    private let base: TGSAnimatedStickerSource
+    private let delay: TimeInterval
+
+    init(base: TGSAnimatedStickerSource, delay: TimeInterval) {
+        self.base = base
+        self.delay = delay
+        self.isVideo = base.isVideo
+    }
+
+    func cachedDataPath(
+        width: Int,
+        height: Int,
+        completion: @escaping ((path: String, complete: Bool)?) -> Void
+    ) -> TGSCancellable {
+        return base.cachedDataPath(width: width, height: height, completion: completion)
+    }
+
+    func directDataPath(
+        attemptSynchronously: Bool,
+        completion: @escaping (String?) -> Void
+    ) -> TGSCancellable {
+        let token = DelayedCancellable()
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [base] in
+            guard !token.isCancelled else {
+                completion(nil)
+                return
+            }
+            let inner = base.directDataPath(
+                attemptSynchronously: attemptSynchronously,
+                completion: completion
+            )
+            token.attach(inner)
+        }
+        return token
+    }
+}
+
+private final class DelayedCancellable: TGSCancellable {
+    private(set) var isCancelled: Bool = false
+    private var inner: TGSCancellable?
+
+    func attach(_ cancellable: TGSCancellable) {
+        if isCancelled {
+            cancellable.cancel()
+            return
+        }
+        inner = cancellable
+    }
+
+    func cancel() {
+        isCancelled = true
+        inner?.cancel()
+        inner = nil
     }
 }
 

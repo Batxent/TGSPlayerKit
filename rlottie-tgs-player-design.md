@@ -35,6 +35,9 @@ animated sticker view/node 自己持有播放 timer，timer 由可见性和播�
 | `LottieInstance` Objective-C++ bridge | `TGSLottieAnimationInstance` / `TGSLottieAnimationLoading` |
 | `SoftwareAnimationRenderer` | UIKit software renderer |
 | `CompressedAnimationRenderer` | 可选 Metal renderer，后续阶段实现 |
+| `StickerShimmerEffectNode` | `TGSStickerShimmerEffectView` |
+| `ShimmerEffectForegroundNode` | `TGSStickerShimmerEffectView` 内部的 `CAGradientLayer` 横向 sweep |
+| Telegram sticker thumbnail SVG | `TGSStickerSilhouette.svgData(_:)` + `TGSSVGPathParser` |
 
 ## 总体架构
 
@@ -243,6 +246,52 @@ scripts/build-rlottie-xcframework.sh
   Telegram iOS 的兼容边界处理。
 - `renderFrame` 用 `rlottie::Surface` 和 `renderSync`。
 
+## Silhouette + Shimmer Placeholder
+
+Telegram iOS 在贴纸首帧抵达前用一段“剪影 + 横向 shimmer”的占位动画，对应实现是
+`StickerShimmerEffectNode` + `ShimmerEffectForegroundNode`。UIKit 版严格对齐这一行为：
+
+```text
+TGSStickerShimmerEffectView
+├── containerLayer (mask = maskLayer)
+│   ├── backgroundLayer (CAShapeLayer, fill = foregroundColor)
+│   └── shimmerLayer  (CAGradientLayer, [clear, shimmeringColor, clear], 横向 sweep)
+└── maskLayer (CAShapeLayer with silhouette path 或 contents = silhouette image)
+```
+
+剪影输入由 `TGSStickerSilhouetteShape` 抽象：
+
+- `.svgData(Data)`：用项目内 `TGSSVGPathParser` 在进程内解析 SVG，无第三方依赖。
+  支持 `M m L l H h V v C c S s Q q T t Z z A a` 全套命令；arc 用 SVG 1.1 规范的
+  弧→三次贝塞尔分段近似（每段 ≤ π/2）。viewBox 缺失时回退到 `width/height`，再退到
+  `path.boundingBox`。
+- `.image(UIImage)`：把 image 的 alpha 通道当作 mask（与 Telegram iOS 接受
+  `placeholderImage` 的形式一致）。
+- `.path(CGPath, viewBox:)`：调用方已有 `CGPath` 时直接走这一条路径，避免重复解析。
+
+shimmer 行为对齐 Telegram iOS：
+
+- 横向方向：`startPoint = (0, 0.5)`、`endPoint = (1, 0.5)`、`locations = [0, 0.5, 1]`。
+- 颜色：`[clear, shimmeringColor, clear]`，默认 `shimmeringColor = white α=0.55`。
+- 动画：`transform.translation.x` 从 `-width` 到 `width`，repeat infinity，
+  `easeInEaseOut`，默认 `duration = 1.3s`。
+- 只在视图位于 window 时挂动画，离开 window 自动停。
+- mask 用 `aspect-fit` 把 viewBox 置于 view bounds 中心，保证 shimmer 仅在
+  剪影区域内可见。
+
+`TGSPlayerView` 集成规则：
+
+- 剪影视图始终被加在 imageView 之上、是子视图最顶层。
+- 赋值 `silhouette` 后立即可见并 `startAnimating`；`showsSilhouetteUntilFirstFrame = false`
+  可立即关闭。
+- 真正首帧（`submitFrame(_:)`）到达时，用 `silhouetteFadeOutDuration`（默认 `0.25s`）
+  做 alpha 过渡淡出，然后 `stopAnimating` + `isHidden = true`。
+- `reset()` / `prepareForReuse()` 清掉首帧标记，cell 复用时剪影会重新出现，
+  这一点与 Telegram iOS `AnimatedStickerNode.reset` 的语义相同。
+
+不引入额外的渲染线程或全局 shimmer 调度器：每个 `TGSStickerShimmerEffectView`
+自己用 Core Animation 的隐式动画驱动，符合“view-local、无全局调度器”这一项目原则。
+
 ## Renderer
 
 UIKit 版本先实现 Telegram `SoftwareAnimationRenderer` 的等价物：
@@ -327,6 +376,11 @@ public final class TGSPlayerView: UIView {
 - invalid lottie data 不 crash。
 - `prepareForReuse` / `reset` 取消 source 和 timer。
 - UIKit 目标在 iOS simulator 编译通过。
+- SVG path parser 覆盖 `M/L/H/V/C/S/Q/T/Z/A` 命令以及 viewBox 缺失/非法 XML/缺 path
+  的失败路径。
+- `TGSStickerShimmerEffectView` 的 `start/stopAnimating`、style 更新、image/svg 输入。
+- `TGSPlayerView` 的剪影显隐：默认隐藏、赋值后显示并 shimmer、首帧后淡出、
+  `reset` 后再次显示、`showsSilhouetteUntilFirstFrame = false` 立即隐藏。
 
 ## 分阶段实施
 

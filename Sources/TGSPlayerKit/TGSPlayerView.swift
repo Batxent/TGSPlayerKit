@@ -71,6 +71,24 @@ public final class TGSPlayerView: UIView {
         stateMachine.state
     }
 
+    public var silhouette: TGSStickerSilhouette? {
+        get { silhouetteView.silhouette }
+        set {
+            silhouetteView.setSilhouette(newValue)
+            updateSilhouetteVisibility(animated: false)
+        }
+    }
+
+    public var showsSilhouetteUntilFirstFrame: Bool = true {
+        didSet { updateSilhouetteVisibility(animated: false) }
+    }
+
+    public var silhouetteFadeOutDuration: TimeInterval = 0.25
+
+    public var hasRenderedFirstFrame: Bool { hasSubmittedFirstFrame }
+
+    public var silhouetteView: TGSStickerShimmerEffectView { _silhouetteView }
+
     private var stateMachine = TGSPlayerStateMachine()
     private var visibilityGate = TGSAnimatedStickerVisibilityGate()
     private var sourceCancellable: TGSCancellable?
@@ -80,6 +98,8 @@ public final class TGSPlayerView: UIView {
     private var playbackMode: TGSAnimatedStickerPlaybackMode = .loop
     private var mode: TGSAnimatedStickerMode = .direct(cachePathPrefix: nil)
     private let imageView = UIImageView()
+    private let _silhouetteView = TGSStickerShimmerEffectView()
+    private var hasSubmittedFirstFrame: Bool = false
 
     public init(
         configuration: TGSPlayerConfiguration = TGSPlayerConfiguration(),
@@ -98,6 +118,8 @@ public final class TGSPlayerView: UIView {
         imageView.contentMode = .scaleAspectFit
         imageView.backgroundColor = .clear
         addSubview(imageView)
+        _silhouetteView.isHidden = true
+        addSubview(_silhouetteView)
     }
 
     @available(*, unavailable)
@@ -108,6 +130,7 @@ public final class TGSPlayerView: UIView {
     public override func layoutSubviews() {
         super.layoutSubviews()
         imageView.frame = bounds
+        _silhouetteView.frame = bounds
     }
 
     public override func didMoveToWindow() {
@@ -134,6 +157,7 @@ public final class TGSPlayerView: UIView {
         reset()
         self.playbackMode = playbackMode
         self.mode = mode
+        updateSilhouetteVisibility(animated: false)
 
         switch mode {
         case .cached:
@@ -339,6 +363,10 @@ public final class TGSPlayerView: UIView {
         frameUpdated(frame.index, frame.totalFrames)
         started()
         delegate?.tgsPlayerViewDidLoadFirstFrame(self)
+        if !hasSubmittedFirstFrame {
+            hasSubmittedFirstFrame = true
+            updateSilhouetteVisibility(animated: true)
+        }
     }
 
     public func reset() {
@@ -354,7 +382,49 @@ public final class TGSPlayerView: UIView {
         currentFrameCount = 0
         currentFrameRate = 0
         isPlaying = false
+        hasSubmittedFirstFrame = false
         stateMachine.prepareForReuse()
+        updateSilhouetteVisibility(animated: false)
+    }
+
+    private func updateSilhouetteVisibility(animated: Bool) {
+        let shouldShow = showsSilhouetteUntilFirstFrame
+            && _silhouetteView.silhouette != nil
+            && !hasSubmittedFirstFrame
+
+        if shouldShow {
+            bringSubviewToFront(_silhouetteView)
+            _silhouetteView.alpha = 1
+            _silhouetteView.isHidden = false
+            _silhouetteView.startAnimating()
+            return
+        }
+
+        guard !_silhouetteView.isHidden else {
+            _silhouetteView.stopAnimating()
+            return
+        }
+
+        let finalize: () -> Void = { [weak self] in
+            guard let self else { return }
+            self._silhouetteView.isHidden = true
+            self._silhouetteView.alpha = 1
+            self._silhouetteView.stopAnimating()
+        }
+
+        if animated, silhouetteFadeOutDuration > 0 {
+            UIView.animate(
+                withDuration: silhouetteFadeOutDuration,
+                delay: 0,
+                options: [.beginFromCurrentState, .allowUserInteraction],
+                animations: { [weak self] in
+                    self?._silhouetteView.alpha = 0
+                },
+                completion: { _ in finalize() }
+            )
+        } else {
+            finalize()
+        }
     }
 
     private func updateIsPlaying() {

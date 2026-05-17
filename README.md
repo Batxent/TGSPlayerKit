@@ -100,6 +100,12 @@ public final class TGSPlayerView: UIView {
     public var visibility: Bool
     public var overrideVisibility: Bool
 
+    public var silhouette: TGSStickerSilhouette?
+    public var showsSilhouetteUntilFirstFrame: Bool
+    public var silhouetteFadeOutDuration: TimeInterval
+    public var silhouetteView: TGSStickerShimmerEffectView { get }
+    public var hasRenderedFirstFrame: Bool { get }
+
     public func setup(
         source: TGSAnimatedStickerSource,
         width: Int,
@@ -120,6 +126,46 @@ public final class TGSPlayerView: UIView {
     public func setOverlayColor(_ color: UIColor?, replace: Bool, animated: Bool)
 }
 ```
+
+## Silhouette + Shimmer Placeholder
+
+Telegram iOS shows a silhouette of the sticker with a horizontal shimmer sweep
+while the lottie data is still loading. `TGSPlayerKit` ports this through
+`TGSStickerShimmerEffectView` and the `silhouette` property on `TGSPlayerView`.
+
+```swift
+let silhouetteSVG = Data(/* <svg viewBox="0 0 512 512"><path d="..."/></svg> */)
+
+playerView.silhouette = .svgData(
+    silhouetteSVG,
+    style: TGSStickerShimmerStyle(
+        foregroundColor: UIColor(white: 0, alpha: 0.08),
+        shimmeringColor: UIColor(white: 1, alpha: 0.55),
+        duration: 1.3
+    )
+)
+playerView.setup(source: source, width: 256, height: 256, playbackMode: .loop, mode: .direct(cachePathPrefix: nil))
+```
+
+Behavior:
+
+- The silhouette covers the player view as soon as it is assigned and starts
+  shimmering. The animation is only added while the view is in a window.
+- When the first `.argb` frame is submitted, `silhouetteFadeOutDuration`
+  (default `0.25s`) is used to crossfade the silhouette out.
+- `reset()` / `prepareForReuse()` re-arm the silhouette so cell reuse keeps
+  showing the placeholder for the next sticker.
+- `showsSilhouetteUntilFirstFrame = false` hides the silhouette immediately
+  if the consumer wants to manage placeholder lifetime manually.
+
+`TGSStickerSilhouetteShape` accepts three shapes:
+
+- `.svgData(Data)` — parsed in-process through the bundled
+  `TGSSVGPathParser` (no third-party dependency, supports the standard
+  `M m L l H h V v C c S s Q q T t Z z A a` command set).
+- `.image(UIImage)` — uses the image's alpha channel as the silhouette mask.
+- `.path(CGPath, viewBox:)` — pre-built path; the view box is `aspect-fit`
+  scaled into the player bounds.
 
 Native rendering follows Telegram's `LottieInstance` shape:
 
@@ -145,6 +191,7 @@ public protocol TGSLottieAnimationInstance: AnyObject {
 - Done: UIKit `TGSPlayerView` scaffold replacing Texture node semantics.
 - Done: SwiftPM binary release template for `TGSPlayerKitRLottieNative.xcframework`.
 - Done: iOS demo app with native `rlottie` playback and stress metrics.
+- Done: silhouette + shimmer placeholder (`TGSStickerShimmerEffectView`) aligned with Telegram iOS `StickerShimmerEffectNode`.
 - Next: Telegram-compatible cached frame source.
 
 ## Building rlottie
