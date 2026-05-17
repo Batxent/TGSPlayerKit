@@ -1,27 +1,30 @@
-# rlottie TGS UIKit 播放器技术设计
+# rlottie TGS UIKit Player Technical Design
 
-## 设计基准
+## Design Baseline
 
-本项目的实现基准不是重新设计一个“合理的 TGS 播放器”，而是遵守
-Telegram iOS 的 animated sticker 实现，只把 Texture / AsyncDisplayKit
-替换为 UIKit / CALayer。
+The implementation baseline for this project is not to redesign a "reasonable TGS
+player." Instead, it follows Telegram iOS animated sticker behavior and only
+replaces Texture / AsyncDisplayKit with UIKit / CALayer.
 
-也就是说：
+In other words:
 
-- `ASDisplayNode` 替换为 `UIView` 或 `CALayer`。
-- `didEnterHierarchy` / `didExitHierarchy` 替换为 `didMoveToWindow` 或
-  UIKit 版 hierarchy tracking layer。
-- `addSubnode` 替换为 `addSubview` / `layer.addSublayer`。
-- `ASDisplayNode.contents` 替换为 `CALayer.contents` 或内部 `UIImageView.image`。
-- 不引入 Texture，但保留 Telegram 的 source、frame source、frame queue、
-  playback mode、visibility gate、renderer pool、direct/cached mode 语义。
+- Replace `ASDisplayNode` with `UIView` or `CALayer`.
+- Replace `didEnterHierarchy` / `didExitHierarchy` with `didMoveToWindow` or a
+  UIKit hierarchy tracking layer.
+- Replace `addSubnode` with `addSubview` / `layer.addSublayer`.
+- Replace `ASDisplayNode.contents` with `CALayer.contents` or an internal
+  `UIImageView.image`.
+- Do not introduce Texture, but keep Telegram semantics for source, frame source,
+  frame queue, playback mode, visibility gate, renderer pool, and direct/cached
+  mode.
 
-旧方案里的“全局播放调度器”不再作为设计方向。Telegram iOS 的主实现是每个
-animated sticker view/node 自己持有播放 timer，timer 由可见性和播放状态控制。
+The "global playback scheduler" from the old plan is no longer a design direction.
+In Telegram iOS, each animated sticker view/node owns its own playback timer, and
+that timer is controlled by visibility and playback state.
 
-## Telegram iOS 对齐表
+## Telegram iOS Alignment Table
 
-| Telegram iOS | UIKit 版本 |
+| Telegram iOS | UIKit Version |
 | --- | --- |
 | `AnimatedStickerNodeSource` | `TGSAnimatedStickerSource` |
 | `AnimatedStickerMode.cached/direct` | `TGSAnimatedStickerMode.cached/direct` |
@@ -31,15 +34,15 @@ animated sticker view/node 自己持有播放 timer，timer 由可见性和播�
 | `AnimatedStickerFrameSource` | `TGSAnimatedStickerFrameSource` |
 | `AnimatedStickerFrameQueue(length: 1)` | `TGSAnimatedStickerFrameQueue(length: 1)` |
 | `DefaultAnimatedStickerNodeImpl` | `TGSPlayerView` |
-| `DirectAnimatedStickerNode` | 后续可作为轻量 direct-only `UIView` 变体 |
+| `DirectAnimatedStickerNode` | Can later be a lightweight direct-only `UIView` variant |
 | `LottieInstance` Objective-C++ bridge | `TGSLottieAnimationInstance` / `TGSLottieAnimationLoading` |
 | `SoftwareAnimationRenderer` | UIKit software renderer |
-| `CompressedAnimationRenderer` | 可选 Metal renderer，后续阶段实现 |
+| `CompressedAnimationRenderer` | Optional Metal renderer, implemented in later phases |
 | `StickerShimmerEffectNode` | `TGSStickerShimmerEffectView` |
-| `ShimmerEffectForegroundNode` | `TGSStickerShimmerEffectView` 内部的 `CAGradientLayer` 横向 sweep |
+| `ShimmerEffectForegroundNode` | Horizontal sweeping `CAGradientLayer` inside `TGSStickerShimmerEffectView` |
 | Telegram sticker thumbnail SVG | `TGSStickerSilhouette.svgData(_:)` + `TGSSVGPathParser` |
 
-## 总体架构
+## Overall Architecture
 
 ```text
 TGSPlayerKit
@@ -60,27 +63,28 @@ TGSPlayerKit
     └── TGSAnimatedStickerVisibilityGate
 ```
 
-核心播放链路必须保持 Telegram 的方向：
+The core playback pipeline must stay aligned with Telegram:
 
 ```text
 setup(source, width, height, playbackMode, mode)
-  -> source.directDataPath 或 source.cachedDataPath
+  -> source.directDataPath or source.cachedDataPath
   -> direct: mappedRead data
-  -> gzip 解压，direct 路径上限跟 Telegram：8 MB
+  -> gzip decompression, direct path limit same as Telegram: 8 MB
   -> LottieInstance(data, fitzModifier, colorReplacements, cacheKey)
-  -> 读取 frameCount / frameRate / dimensions
+  -> read frameCount / frameRate / dimensions
   -> AnimatedStickerFrameSource
   -> AnimatedStickerFrameQueue(length: 1)
   -> Timer(1 / frameRate)
   -> frameQueue.take(draw: true)
   -> renderer.render(frame)
-  -> 主线程提交 UIImage / CALayer contents
+  -> submit UIImage / CALayer contents on main thread
 ```
 
-## Source 设计
+## Source Design
 
-遵守 Telegram 的 source 边界：播放器不直接知道业务资源系统，只依赖 source
-返回 direct path 或 cached path。
+Follow Telegram source boundaries: the player should not know the business asset
+system directly. It only depends on the source returning a direct path or cached
+path.
 
 ```swift
 public protocol TGSAnimatedStickerSource {
@@ -99,17 +103,18 @@ public protocol TGSAnimatedStickerSource {
 }
 ```
 
-开源库可以提供三种 source：
+The open-source library can provide three sources:
 
 - `TGSAnimatedStickerLocalFileSource`
 - `TGSAnimatedStickerDataSource`
 - `TGSAnimatedStickerURLSource`
 
-但最终都要适配成 Telegram 同款 direct/cached path 语义，而不是让 UI 层读取业务模型。
+But all of them must be adapted to Telegram-style direct/cached path semantics,
+instead of letting the UI layer read business models directly.
 
 ## Playback Mode
 
-Playback mode 必须与 Telegram 对齐：
+Playback mode must align with Telegram:
 
 ```swift
 public enum TGSAnimatedStickerPlaybackMode {
@@ -127,72 +132,79 @@ public enum TGSAnimatedStickerPlaybackPosition {
 }
 ```
 
-行为要求：
+Behavior requirements:
 
-- `.once` 播放到最后一帧后停止并回调 completed(true)。
-- `.count(n)` 完成 n 次 loop 后停止。
-- `.loop` 每次到最后一帧回调 completed(false)，继续播放。
-- `.still(.start/.end/.timestamp/.frameIndex)` 只渲染目标帧。
-- `stopAtNearestLoop` 在下一次 loop 边界停止。
+- `.once` stops at the last frame and calls `completed(true)`.
+- `.count(n)` stops after `n` completed loops.
+- `.loop` calls `completed(false)` at each end frame and continues playing.
+- `.still(.start/.end/.timestamp/.frameIndex)` renders only the target frame.
+- `stopAtNearestLoop` stops at the next loop boundary.
 
 ## Visibility Gate
 
-Telegram 的播放开关由 `visibility`、是否在 hierarchy、`overrideVisibility` 共同决定。
+Telegram playback gating is determined by `visibility`, hierarchy presence, and
+`overrideVisibility`.
 
-UIKit 版本使用：
+The UIKit version uses:
 
 ```swift
 shouldPlay = visibility && (isDisplaying || overrideVisibility)
 ```
 
-当 `autoplay == true` 时，view 可以绕过外部 visibility 输入主动播放。
+When `autoplay == true`, the view can actively play without external visibility
+input.
 
-Texture 的 `AnimatedStickerNodeDisplayEvents` 在 UIKit 中替换为：
+Texture's `AnimatedStickerNodeDisplayEvents` is replaced in UIKit by:
 
-- 最小版本：`didMoveToWindow`。
-- 更严格版本：独立 `HierarchyTrackingLayer`，进入/离开 window 时触发。
+- Minimal version: `didMoveToWindow`.
+- Stricter version: a dedicated `HierarchyTrackingLayer` that triggers on
+  enter/leave window.
 
 ## Frame Source
 
 ### Direct Frame Source
 
-Direct path 与 Telegram 的 `AnimatedStickerDirectFrameSource` 对齐：
+The direct path aligns with Telegram's `AnimatedStickerDirectFrameSource`:
 
-- 保存 `data`、`width`、`height`、`bytesPerRow`、`currentFrame`。
-- gzip 解压：`TGGUnzipData(data, 8 * 1024 * 1024) ?? data` 的等价实现。
-- `LottieInstance` 加载失败则 source 创建失败。
-- `frameCount = max(1, animation.frameCount)`。
-- `frameRate = max(1, animation.frameRate)`。
-- 每次 `takeFrame(draw:)` 都先计算 `currentFrame % frameCount`，然后递增。
-- `draw == false` 时只前进帧，不生成 bitmap。
-- `draw == true` 时调用 rlottie render 到 ARGB buffer。
+- Store `data`, `width`, `height`, `bytesPerRow`, and `currentFrame`.
+- gzip decompression equivalent to `TGGUnzipData(data, 8 * 1024 * 1024) ?? data`.
+- Source creation fails if `LottieInstance` fails to load.
+- `frameCount = max(1, animation.frameCount)`.
+- `frameRate = max(1, animation.frameRate)`.
+- Each `takeFrame(draw:)` computes `currentFrame % frameCount` first, then
+  increments.
+- When `draw == false`, only advance the frame index without generating a bitmap.
+- When `draw == true`, render with rlottie into an ARGB buffer.
 
 ### Cached Frame Source
 
-Cached path 必须遵守 Telegram 的缓存格式，而不是自定义一套不兼容格式。
+The cached path must follow Telegram cache formats, not a custom incompatible one.
 
-Telegram 现在有两条相关路线：
+Telegram currently has two related paths:
 
-- `AnimatedStickerCachedFrameSource`：读取 frame table，LZFSE 解压，再用 XOR delta 还原。
-- `AnimationCache` / `DCTAnimationCacheImpl` / `SubcodecAnimationCacheImpl`：
-  用 writer 把帧写入可复用缓存，再由 multi animation renderer 读取。
+- `AnimatedStickerCachedFrameSource`: read frame table, LZFSE decompress, then
+  restore with XOR delta.
+- `AnimationCache` / `DCTAnimationCacheImpl` / `SubcodecAnimationCacheImpl`:
+  writer stores frames into reusable cache, then multi animation renderer reads it.
 
-开源第一阶段可以只实现 direct mode，但 public API 必须保留 `.cached`。一旦实现
-cached mode，文件格式、帧推进、first-frame 读取语义必须对齐 Telegram。
+Phase 1 in open-source can implement only direct mode, but the public API must keep
+`.cached`. Once cached mode is implemented, file format, frame progression, and
+first-frame reading semantics must align with Telegram.
 
 ## Frame Queue
 
-`TGSAnimatedStickerFrameQueue` 保持 Telegram 的 length 1 模型：
+`TGSAnimatedStickerFrameQueue` keeps Telegram's length-1 model:
 
-- `take(draw:)`：队列为空时从 source 取一帧，然后弹出第一帧。
-- `generateFramesIfNeeded()`：队列为空时预取下一帧。
-- 不做多帧堆积，不引入“为了流畅度”的大队列。
+- `take(draw:)`: when queue is empty, fetch one frame from source, then pop the
+  first frame.
+- `generateFramesIfNeeded()`: prefetch next frame when queue is empty.
+- No multi-frame accumulation and no large queue for "smoothness."
 
-这个设计比大缓存更适合 cell 复用和快速取消。
+This design is better than large buffering for cell reuse and fast cancellation.
 
 ## Native Bridge
 
-Objective-C++ bridge 对齐 Telegram 的 `LottieInstance`：
+The Objective-C++ bridge aligns with Telegram's `LottieInstance`:
 
 ```objc
 @interface TGSLottieInstance : NSObject
@@ -215,7 +227,7 @@ Objective-C++ bridge 对齐 Telegram 的 `LottieInstance`：
 @end
 ```
 
-当前仓库已落地 bridge 和本地 artifact 构建脚本：
+This repository already includes the bridge and local artifact build script:
 
 ```text
 NativeCore/RLottieBinding/TGSLottieInstance.h
@@ -224,90 +236,103 @@ NativeCore/RLottieBinding/module.modulemap
 scripts/build-rlottie-xcframework.sh
 ```
 
-默认 SwiftPM target 不编译这部分，原因是 open-source repo 在没有 native artifact
-时仍必须能被 clone、test、CI。发布版本使用 binary target：
+By default, SwiftPM targets do not compile this part, because an open-source repo
+must still be cloneable, testable, and CI-friendly without native artifacts. The
+release path uses binary targets:
 
-- `NativeCore/Artifacts/rlottie.xcframework`：Telegram fork 的原始静态库 artifact。
-- `NativeCore/Artifacts/TGSPlayerKitRLottieNative.xcframework`：SwiftPM 对外消费的
-  framework-style binary target，内部合并 `rlottie` 静态库和 `TGSLottieInstance` bridge。
+- `NativeCore/Artifacts/rlottie.xcframework`: raw static library artifact from
+  Telegram fork.
+- `NativeCore/Artifacts/TGSPlayerKitRLottieNative.xcframework`: framework-style
+  binary target for SwiftPM consumers, internally merging `rlottie` static library
+  and `TGSLottieInstance` bridge.
 
-这里不选 SwiftPM native target：native target 会要求使用方本地编译 Telegram `rlottie`
-和 CMake/Xcode C++ 配置，安装成本、CI 不确定性、编译时间都不适合 GitHub 开源库默认路径。
+SwiftPM native target is not selected here: it would force consumers to compile
+Telegram `rlottie` locally with CMake/Xcode C++ configuration, and that install
+cost, CI uncertainty, and compile time are not suitable for the default GitHub
+open-source path.
 
-实现约束：
+Implementation constraints:
 
-- `.mm` 内部持有 `std::unique_ptr<rlottie::Animation>`。
-- 使用 `rlottie::Animation::loadFromData(...)`。
-- `frameCount`、`frameRate` 至少为 1。
-- dimensions 至少为 1x1。
-- 遵守 Telegram bridge 的安全上限：dimensions 不超过 1536x1536，
-  frameRate 不超过 360，duration 不超过 9 秒。
-- TGS 业务约束 512x512 / 3 秒可以在更上层校验，但 native bridge 先按
-  Telegram iOS 的兼容边界处理。
-- `renderFrame` 用 `rlottie::Surface` 和 `renderSync`。
+- `.mm` internally owns `std::unique_ptr<rlottie::Animation>`.
+- Use `rlottie::Animation::loadFromData(...)`.
+- `frameCount` and `frameRate` must be at least 1.
+- Dimensions must be at least 1x1.
+- Follow Telegram bridge safety limits: dimensions <= 1536x1536, frameRate <= 360,
+  duration <= 9 seconds.
+- TGS business constraints (512x512 / 3 seconds) can be validated at upper layers,
+  while native bridge first follows Telegram iOS compatibility boundaries.
+- `renderFrame` uses `rlottie::Surface` and `renderSync`.
 
 ## Silhouette + Shimmer Placeholder
 
-Telegram iOS 在贴纸首帧抵达前用一段“剪影 + 横向 shimmer”的占位动画，对应实现是
-`StickerShimmerEffectNode` + `ShimmerEffectForegroundNode`。UIKit 版严格对齐这一行为：
+Before the first sticker frame arrives, Telegram iOS shows a "silhouette + horizontal
+shimmer" placeholder animation, implemented as `StickerShimmerEffectNode` +
+`ShimmerEffectForegroundNode`. The UIKit version strictly aligns with this behavior:
 
 ```text
 TGSStickerShimmerEffectView
 ├── containerLayer (mask = maskLayer)
 │   ├── backgroundLayer (CAShapeLayer, fill = foregroundColor)
-│   └── shimmerLayer  (CAGradientLayer, [clear, shimmeringColor, clear], 横向 sweep)
-└── maskLayer (CAShapeLayer with silhouette path 或 contents = silhouette image)
+│   └── shimmerLayer  (CAGradientLayer, [clear, shimmeringColor, clear], horizontal sweep)
+└── maskLayer (CAShapeLayer with silhouette path or contents = silhouette image)
 ```
 
-剪影输入由 `TGSStickerSilhouetteShape` 抽象：
+Silhouette input is abstracted by `TGSStickerSilhouetteShape`:
 
-- `.svgData(Data)`：用项目内 `TGSSVGPathParser` 在进程内解析 SVG，无第三方依赖。
-  支持 `M m L l H h V v C c S s Q q T t Z z A a` 全套命令；arc 用 SVG 1.1 规范的
-  弧→三次贝塞尔分段近似（每段 ≤ π/2）。viewBox 缺失时回退到 `width/height`，再退到
-  `path.boundingBox`。
-- `.image(UIImage)`：把 image 的 alpha 通道当作 mask（与 Telegram iOS 接受
-  `placeholderImage` 的形式一致）。
-- `.path(CGPath, viewBox:)`：调用方已有 `CGPath` 时直接走这一条路径，避免重复解析。
+- `.svgData(Data)`: parse SVG in-process using internal `TGSSVGPathParser`, with no
+  third-party dependency. Supports full command set `M m L l H h V v C c S s Q q T t
+  Z z A a`; arcs use SVG 1.1 compliant arc-to-cubic segmented approximation (each
+  segment <= pi/2). If `viewBox` is missing, fallback to `width/height`, then
+  `path.boundingBox`.
+- `.image(UIImage)`: use image alpha channel as mask (aligned with Telegram iOS
+  `placeholderImage` behavior).
+- `.path(CGPath, viewBox:)`: if caller already has `CGPath`, use it directly to
+  avoid duplicate parsing.
 
-shimmer 行为对齐 Telegram iOS：
+Shimmer behavior aligned with Telegram iOS:
 
-- 横向方向：`startPoint = (0, 0.5)`、`endPoint = (1, 0.5)`、`locations = [0, 0.5, 1]`。
-- 颜色：`[clear, shimmeringColor, clear]`，默认 `shimmeringColor = white α=0.55`。
-- 动画：`transform.translation.x` 从 `-width` 到 `width`，repeat infinity，
-  `easeInEaseOut`，默认 `duration = 1.3s`。
-- 只在视图位于 window 时挂动画，离开 window 自动停。
-- mask 用 `aspect-fit` 把 viewBox 置于 view bounds 中心，保证 shimmer 仅在
-  剪影区域内可见。
+- Horizontal direction: `startPoint = (0, 0.5)`, `endPoint = (1, 0.5)`,
+  `locations = [0, 0.5, 1]`.
+- Colors: `[clear, shimmeringColor, clear]`, default
+  `shimmeringColor = white alpha 0.55`.
+- Animation: `transform.translation.x` from `-width` to `width`, infinite repeat,
+  `easeInEaseOut`, default `duration = 1.3s`.
+- Attach animation only while view is in window; stop automatically when removed.
+- Mask uses aspect-fit to place viewBox at the center of view bounds, ensuring the
+  shimmer is visible only inside silhouette region.
 
-`TGSPlayerView` 集成规则：
+`TGSPlayerView` integration rules:
 
-- 剪影视图始终被加在 imageView 之上、是子视图最顶层。
-- 赋值 `silhouette` 后立即可见并 `startAnimating`；`showsSilhouetteUntilFirstFrame = false`
-  可立即关闭。
-- 真正首帧（`submitFrame(_:)`）到达时，用 `silhouetteFadeOutDuration`（默认 `0.25s`）
-  做 alpha 过渡淡出，然后 `stopAnimating` + `isHidden = true`。
-- `reset()` / `prepareForReuse()` 清掉首帧标记，cell 复用时剪影会重新出现，
-  这一点与 Telegram iOS `AnimatedStickerNode.reset` 的语义相同。
+- Silhouette view is always added above `imageView` as the top-most subview.
+- After assigning `silhouette`, it becomes visible immediately and calls
+  `startAnimating`; set `showsSilhouetteUntilFirstFrame = false` to disable
+  immediately.
+- When the real first frame (`submitFrame(_:)`) arrives, fade out with
+  `silhouetteFadeOutDuration` (default `0.25s`) through alpha transition, then
+  `stopAnimating` + `isHidden = true`.
+- `reset()` / `prepareForReuse()` clear first-frame state so silhouette appears
+  again on cell reuse, matching Telegram iOS `AnimatedStickerNode.reset` semantics.
 
-不引入额外的渲染线程或全局 shimmer 调度器：每个 `TGSStickerShimmerEffectView`
-自己用 Core Animation 的隐式动画驱动，符合“view-local、无全局调度器”这一项目原则。
+No extra render thread or global shimmer scheduler is introduced: each
+`TGSStickerShimmerEffectView` is driven by local Core Animation implicit animations,
+which follows the project principle of "view-local, no global scheduler."
 
 ## Renderer
 
-UIKit 版本先实现 Telegram `SoftwareAnimationRenderer` 的等价物：
+UIKit first implements the equivalent of Telegram `SoftwareAnimationRenderer`:
 
-- `.argb`：直接生成 `CGImage` / `UIImage`。
-- `.yuva`：cached mode 实现后补 `YUVA -> RGBA` 转换。
-- `.dct`：Metal/DCT cache 实现后补。
-- overlay color 用 template image 或独立 overlay image view 实现。
-- frame 提交发生在主线程。
+- `.argb`: directly produce `CGImage` / `UIImage`.
+- `.yuva`: add `YUVA -> RGBA` conversion after cached mode lands.
+- `.dct`: add after Metal/DCT cache implementation.
+- Overlay color is implemented via template image or a separate overlay image view.
+- Frame submission happens on the main thread.
 
-`CompressedAnimationRenderer` 对应的 Metal path 可以作为 Phase 3，但不能提前改变
-direct frame source 和 playback mode 语义。
+The Metal path corresponding to `CompressedAnimationRenderer` can be Phase 3, but it
+must not change direct frame source and playback mode semantics in advance.
 
 ## UIKit API
 
-`TGSPlayerView` 对齐 Telegram node API：
+`TGSPlayerView` aligns with Telegram node API:
 
 ```swift
 public final class TGSPlayerView: UIView {
@@ -346,76 +371,79 @@ public final class TGSPlayerView: UIView {
 }
 ```
 
-可以额外保留 `setSource(_:)`、`renderFirstFrame()` 这类 convenience API，但不能让它们
-成为真实架构主线。
+Extra convenience APIs such as `setSource(_:)` and `renderFirstFrame()` may remain,
+but they must not become the core architecture path.
 
-## 不引入 Texture 的替换规则
+## Texture-Free Replacement Rules
 
-| Texture 写法 | UIKit 替换 |
+| Texture Style | UIKit Replacement |
 | --- | --- |
 | `ASDisplayNode` | `UIView` |
-| `ASDisplayNode(viewBlock:)` | lazy `UIView` / 子类 |
+| `ASDisplayNode(viewBlock:)` | lazy `UIView` / subclass |
 | `addSubnode` | `addSubview` |
 | `removeFromSupernode` | `removeFromSuperview` |
 | `node.contents` | `view.layer.contents` |
-| `isInHierarchy` | `window != nil` 或 hierarchy tracking layer |
+| `isInHierarchy` | `window != nil` or hierarchy tracking layer |
 | node renderer pool | view renderer pool |
 
-除此之外，不额外改 Telegram 的播放语义。
+Beyond this, do not change Telegram playback semantics.
 
-## 测试策略
+## Testing Strategy
 
-必须覆盖：
+Must cover:
 
-- playback mode 枚举与 Telegram 一致。
-- visibility gate 行为一致。
-- frame queue length 1 预取一致。
-- direct frame source 的 frame index 递增和 loop。
-- `skipToEnd` / `skipToFrameIndex`。
-- gzip 解压上限。
-- invalid lottie data 不 crash。
-- `prepareForReuse` / `reset` 取消 source 和 timer。
-- UIKit 目标在 iOS simulator 编译通过。
-- SVG path parser 覆盖 `M/L/H/V/C/S/Q/T/Z/A` 命令以及 viewBox 缺失/非法 XML/缺 path
-  的失败路径。
-- `TGSStickerShimmerEffectView` 的 `start/stopAnimating`、style 更新、image/svg 输入。
-- `TGSPlayerView` 的剪影显隐：默认隐藏、赋值后显示并 shimmer、首帧后淡出、
-  `reset` 后再次显示、`showsSilhouetteUntilFirstFrame = false` 立即隐藏。
+- Playback mode enum compatibility with Telegram.
+- Visibility gate behavior compatibility.
+- Frame queue length-1 prefetch compatibility.
+- Direct frame source frame index progression and loop behavior.
+- `skipToEnd` / `skipToFrameIndex`.
+- gzip decompression size limit.
+- Invalid lottie data must not crash.
+- `prepareForReuse` / `reset` cancel source and timer.
+- UIKit target builds successfully on iOS simulator.
+- SVG path parser covers `M/L/H/V/C/S/Q/T/Z/A` commands and failure paths for
+  missing viewBox / invalid XML / missing path.
+- `TGSStickerShimmerEffectView` `start/stopAnimating`, style updates, and image/svg
+  inputs.
+- `TGSPlayerView` silhouette visibility lifecycle: hidden by default, visible with
+  shimmer after assignment, fades out after first frame, reappears after `reset`,
+  and hides immediately when `showsSilhouetteUntilFirstFrame = false`.
 
-## 分阶段实施
+## Phased Implementation
 
-### Phase 1：Telegram 语义骨架
+### Phase 1: Telegram Semantics Skeleton
 
-- SwiftPM 工程。
-- Telegram-compatible public types。
-- UIKit `TGSPlayerView` 替换 `DefaultAnimatedStickerNodeImpl`。
-- Direct frame source 协议和测试。
-- README 明确“不引入 Texture，但遵守 Telegram iOS playback model”。
+- SwiftPM project.
+- Telegram-compatible public types.
+- UIKit `TGSPlayerView` replaces `DefaultAnimatedStickerNodeImpl`.
+- Direct frame source protocol and tests.
+- README explicitly states: "No Texture, but follows Telegram iOS playback model."
 
-### Phase 2：rlottie bridge
+### Phase 2: rlottie Bridge
 
-- 已使用 `scripts/build-rlottie-xcframework.sh` 编译
-  `NativeCore/Artifacts/rlottie.xcframework`。
-- 已落地 `TGSLottieInstance.h/mm`，保持 Telegram `LottieInstance` 的 native 入口形状。
-- 选择 SwiftPM native target 或 binary target 作为发布包装。
-- direct mode 真正渲染 `.tgs`。
-- iOS example app 播放本地 `.tgs`。
+- `NativeCore/Artifacts/rlottie.xcframework` has been built via
+  `scripts/build-rlottie-xcframework.sh`.
+- `TGSLottieInstance.h/mm` is in place, preserving Telegram `LottieInstance`
+  native entry shape.
+- Select SwiftPM native target or binary target for release packaging.
+- Direct mode truly renders `.tgs`.
+- iOS example app plays local `.tgs`.
 
-### Phase 3：缓存和 renderer
+### Phase 3: Cache and Renderer
 
-- 实现 Telegram-compatible cached frame source。
-- 补 YUVA/DCT renderer。
-- 可选 Metal renderer。
-- long-list 示例和性能数据。
+- Implement Telegram-compatible cached frame source.
+- Add YUVA/DCT renderer.
+- Optional Metal renderer.
+- Long-list example and performance data.
 
-### Phase 4：开源发布质量
+### Phase 4: Open-Source Release Quality
 
-- API docs。
-- Example app。
-- CI 覆盖 SwiftPM test 和 iOS simulator build。
-- License / NOTICE / benchmark 报告。
+- API docs.
+- Example app.
+- CI covers SwiftPM tests and iOS simulator build.
+- License / NOTICE / benchmark reports.
 
-## 参考
+## References
 
 - Telegram iOS `AnimatedStickerNode`
 - Telegram iOS `AnimatedStickerFrameSource`
