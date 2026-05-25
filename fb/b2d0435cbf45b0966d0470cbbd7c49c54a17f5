@@ -1,0 +1,23 @@
+Tests/TGSPlayerKitTests/TGSAnimatedStickerCachedFrameSourceTests.swift
+  s_227146c36eac82::t_0f6e95dc5a976e 1-371
+Sources/TGSPlayerKit/TGSAnimatedStickerCachedFrameSource.swift
+  s_227146c36eac82::t_e447300965f2c0 1-514
+Sources/TGSPlayerKit/TGSPlayerError.swift
+  s_227146c36eac82::t_6220f34ea03d5f 13-22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "fbb2d0435cbf45b0966d0470cbbd7c49c54a17f5",
+  "prompts": {},
+  "sessions": {
+    "s_227146c36eac82": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "daf56d41-ff4f-47f9-ae53-e8c134cedb1b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "tommy <batxent@me.com>"
+    }
+  }
+}
