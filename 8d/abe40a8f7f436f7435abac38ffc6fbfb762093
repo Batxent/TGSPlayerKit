@@ -1,0 +1,27 @@
+Sources/TGSPlayerKit/TGSPlaybackCoordinator.swift
+  s_227146c36eac82::t_ecf0e17c32cca1 1-209
+Sources/TGSPlayerKit/TGSPlayerView.swift
+  s_227146c36eac82::t_75b39807aac2b2 402-407,413-414
+  s_227146c36eac82::t_379a22ff7c99a2 135-143
+  s_227146c36eac82::t_f07d6bad026954 333-337
+  s_227146c36eac82::t_f1edca082ae2c7 490-492,508-511,513-528,530,532-543,545-554,557,561-616,623,627-634
+  s_227146c36eac82::t_16c79715849d70 203-211
+Tests/TGSPlayerKitTests/DemoProjectScaffoldTests.swift
+  s_227146c36eac82::t_0b85bf56779252 28,31-40,42-47,53-55
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "8dabe40a8f7f436f7435abac38ffc6fbfb762093",
+  "prompts": {},
+  "sessions": {
+    "s_227146c36eac82": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "daf56d41-ff4f-47f9-ae53-e8c134cedb1b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "tommy <batxent@me.com>"
+    }
+  }
+}
