@@ -25,20 +25,34 @@ final class DemoProjectScaffoldTests: XCTestCase {
     func testPlayerTimerRunsOffMainQueueForScrollingPlayback() throws {
         let root = packageRoot()
         let playerView = root.appendingPathComponent("Sources/TGSPlayerKit/TGSPlayerView.swift")
+        let coordinator = root.appendingPathComponent("Sources/TGSPlayerKit/TGSPlaybackCoordinator.swift")
 
         let playerViewText = try String(contentsOf: playerView)
-        // Scrolling-friendly playback requires the per-frame tick to live off the main
-        // RunLoop entirely, so UITrackingRunLoopMode can't starve the animation. A
-        // background DispatchSource timer targeted at the per-view workQueue (which
-        // itself targets the concurrent render pool) trivially satisfies this — much more
-        // robust than the legacy Timer.scheduledTimer + RunLoop.main approach.
+        let coordinatorText = try String(contentsOf: coordinator)
+
+        // Scrolling-friendly playback requires that the per-frame tick can't be starved
+        // by UITrackingRunLoopMode. A global CADisplayLink registered to .common modes
+        // fires during scroll, and per-view render work is dispatched to background
+        // workQueues. Together those satisfy "playback keeps going while the user drags".
         XCTAssertTrue(
-            playerViewText.contains("DispatchSource.makeTimerSource(queue: workQueue)"),
-            "Playback timer must be a DispatchSourceTimer on the per-view workQueue"
+            coordinatorText.contains("link.add(to: .main, forMode: .common)"),
+            "Coordinator's CADisplayLink must run in common modes so playback continues during scroll"
+        )
+        XCTAssertTrue(
+            coordinatorText.contains("CADisplayLink(target: self, selector: #selector(handleVsync(_:)))"),
+            "Coordinator must drive frame scheduling from a CADisplayLink"
+        )
+        XCTAssertTrue(
+            playerViewText.contains("TGSPlaybackCoordinator.shared.register"),
+            "Active playback must register the view with the global coordinator"
         )
         XCTAssertFalse(
             playerViewText.contains("Timer.scheduledTimer"),
             "Main-RunLoop timers stall under UITrackingRunLoopMode and must not be used"
+        )
+        XCTAssertFalse(
+            playerViewText.contains("DispatchSource.makeTimerSource"),
+            "Per-view DispatchSourceTimers were replaced by the global TGSPlaybackCoordinator"
         )
     }
 

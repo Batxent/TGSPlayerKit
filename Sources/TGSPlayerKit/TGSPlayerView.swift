@@ -132,7 +132,15 @@ public final class TGSPlayerView: UIView {
     ///      operations on a single instance.
     private var frameSource: TGSAnimatedStickerFrameSource?
     private var frameQueue: TGSAnimatedStickerFrameQueue?
-    private var playbackTimer: DispatchSourceTimer?
+
+    // MARK: - Coordinator wiring (main thread)
+    /// When this view is actively driving playback, it's registered with
+    /// `TGSPlaybackCoordinator.shared`, which fires a global `CADisplayLink` and asks the
+    /// view for the next frame at every vsync. The entry is the channel through which the
+    /// view's workQueue publishes rendered frames back to the coordinator for batched
+    /// commit. `nil` means this view is currently idle (paused / stopped / reset / never
+    /// started). Main-thread only.
+    private var coordinatorEntry: TGSPlaybackCoordinator.ViewEntry?
 
     // MARK: - Generation token
     /// Each `reset()` bumps the token; work on `workQueue` compares before committing to the main thread.
@@ -192,14 +200,19 @@ public final class TGSPlayerView: UIView {
     }
 
     deinit {
-        // `playbackTimer` / `frameSource` / `frameQueue` are `workQueue`-only.
-        // Tear them down on `workQueue` so they are not released while `lottie_render` may still be running.
+        // Coordinator holds a weak reference to self via its ViewEntry, so it will
+        // auto-prune our entry on its next vsync. We deliberately do NOT dispatch a
+        // cleanup to the main thread from here — Swift's deinit guarantees no further
+        // references to self exist, and queueing an async closure that captured the
+        // about-to-be-deallocated reference would be undefined behavior.
+        //
+        // `frameSource` / `frameQueue` are workQueue-only state; release them on the
+        // workQueue so they can't be dropped mid-render. Capture them by value so the
+        // closure doesn't reference self.
         let queue = self.workQueue
-        let timer = self.playbackTimer
         let source = self.frameSource
         let fq = self.frameQueue
         queue.async {
-            timer?.cancel()
             _ = source
             _ = fq
         }
@@ -317,18 +330,18 @@ public final class TGSPlayerView: UIView {
         CATransaction.commit()
         stateMachine.prepareForReuse()
         updateSilhouetteVisibility(animated: false)
+        // Drop our coordinator registration; the global display link can park if no
+        // other views are active. Any in-flight worker task for the previous entry
+        // will resolve harmlessly because the generation check will fail.
+        TGSPlaybackCoordinator.shared.unregister(self)
+        coordinatorEntry = nil
 
         // 2. Release workQueue-only state on `workQueue`.
         // No generation check here — the next `setup` overwrites in-order on the serial queue; clearing unconditionally is safer.
         workQueue.async { [weak self] in
             guard let self else { return }
-            self.playbackTimer?.cancel()
-            self.playbackTimer = nil
             self.frameSource = nil
             self.frameQueue = nil
-            // Mirror the main-thread `hasSubmittedFirstFrame = false` so the next setup's
-            // first frame re-runs the started() / silhouette fade transition exactly once.
-            self.hasSubmittedFirstFrameOnWorkQueue = false
         }
     }
 
@@ -386,23 +399,19 @@ public final class TGSPlayerView: UIView {
     public func pause() {
         stateMachine.pause()
         delegate?.tgsPlayerViewDidPause(self)
-        cancelPlaybackTimerOnWorkQueue()
+        // Stop receiving vsync ticks. Any in-flight render task on the workQueue still
+        // runs to completion; its result goes into the now-detached entry's pending slot
+        // (the coordinator already dropped that entry from its map, so the commit is
+        // never applied — same effect as cancelling).
+        TGSPlaybackCoordinator.shared.unregister(self)
+        coordinatorEntry = nil
     }
 
     public func stop() {
         stateMachine.stop()
         isPlaying = false
-        cancelPlaybackTimerOnWorkQueue()
-    }
-
-    private func cancelPlaybackTimerOnWorkQueue() {
-        // No generation check: cancel is always safe. The serial `workQueue` orders
-        // chained calls like pause→play; the last enqueued operation wins.
-        workQueue.async { [weak self] in
-            guard let self else { return }
-            self.playbackTimer?.cancel()
-            self.playbackTimer = nil
-        }
+        TGSPlaybackCoordinator.shared.unregister(self)
+        coordinatorEntry = nil
     }
 
     public func seekTo(_ position: TGSAnimatedStickerPlaybackPosition) {
@@ -478,7 +487,9 @@ public final class TGSPlayerView: UIView {
 
     // MARK: - workQueue helpers
 
-    /// `workQueue` only. Renders the current frame immediately, then starts a repeating timer if needed.
+    /// `workQueue` only. Renders the current frame immediately and hops to main to apply it,
+    /// then (unless `firstFrame == true`) registers this view with the global playback
+    /// coordinator so subsequent frames are driven by the shared CADisplayLink.
     private func startPlaybackOnWorkQueue(
         firstFrame: Bool,
         fromIndex: Int?,
@@ -493,111 +504,135 @@ public final class TGSPlayerView: UIView {
         if let fromIndex {
             frameSource.skipToFrameIndex(fromIndex)
         }
-        playbackTimer?.cancel()
-        playbackTimer = nil
 
-        // Draw one frame immediately so the first frame appears without waiting for the timer.
-        renderTickOnWorkQueue(skipFrames: 0, generation: generation)
+        // Render the very first frame eagerly so the cell shows content without waiting
+        // for the next vsync. The coordinator picks it up from there.
+        let firstCommit = makeCommitOnWorkQueue(skipFrames: 0, generation: generation)
+        let frameRate = frameSource.frameRate
 
-        if firstFrame {
-            return
-        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard self.currentGeneration() == generation else { return }
 
-        let interval = 1.0 / Double(max(1, frameSource.frameRate))
-        let timer = DispatchSource.makeTimerSource(queue: workQueue)
-        timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(2))
-        timer.setEventHandler { [weak self, weak timer] in
-            guard let self, let timer else { return }
-            guard self.currentGeneration() == generation else {
-                self.playbackTimer?.cancel()
-                self.playbackTimer = nil
-                return
+            if let firstCommit {
+                self.applyCoordinatedCommit(firstCommit)
             }
-            // `timer.data` is the number of ticks accumulated since the last handler call.
-            // When the render pool falls behind (long lists, thermal throttling), we want to
-            // advance the frame index by the missed count but only render the latest frame —
-            // never burn CPU rendering stale intermediate frames the user will never see.
-            let ticks = max(1, Int(timer.data))
-            self.renderTickOnWorkQueue(skipFrames: ticks - 1, generation: generation)
+
+            if firstFrame { return }
+
+            // Register with the coordinator. From this point onwards every new frame is
+            // driven by the global CADisplayLink and committed in a batched CATransaction.
+            self.coordinatorEntry = TGSPlaybackCoordinator.shared.register(
+                self,
+                frameRate: frameRate
+            )
         }
-        playbackTimer = timer
-        timer.resume()
     }
 
-    /// `workQueue` only. Advance `skipFrames` frames without rendering, then render the next frame
-    /// and hand it to the main thread.
-    private func renderTickOnWorkQueue(skipFrames: Int, generation: UInt64) {
-        guard let frameQueue else { return }
+    /// Called by `TGSPlaybackCoordinator` on the main thread when this view's next frame is
+    /// due. Bounces the work onto the per-view serial workQueue (so it can run in parallel
+    /// with other views on the shared `renderPool`) and lets the result land in the
+    /// coordinator entry's pending slot for the next vsync to commit.
+    internal func dispatchCoordinatedTick(
+        skipFrames: Int,
+        entry: TGSPlaybackCoordinator.ViewEntry
+    ) {
+        let generation = currentGeneration()
+        workQueue.async { [weak self, weak entry] in
+            guard let self else { return }
+            guard let entry else { return }
+            guard self.currentGeneration() == generation else {
+                // Reset / setup happened while this tick was scheduled. Clear the in-flight
+                // flag on main so the coordinator doesn't stall waiting on us forever.
+                DispatchQueue.main.async { entry.inFlight = false }
+                return
+            }
+            guard let commit = self.makeCommitOnWorkQueue(
+                skipFrames: skipFrames,
+                generation: generation
+            ) else {
+                DispatchQueue.main.async { entry.inFlight = false }
+                return
+            }
+            entry.submitPendingCommit(commit)
+        }
+    }
+
+    /// Main thread only. Called by `TGSPlaybackCoordinator` from inside its per-vsync
+    /// `CATransaction.setDisableActions(true)` envelope, so the `layer.contents` write
+    /// here doesn't need its own transaction in the coordinator path. The one place that
+    /// calls this outside a coordinator transaction is the eager first-frame path in
+    /// `startPlaybackOnWorkQueue`; we wrap that one in its own transaction below.
+    internal func applyCoordinatedCommit(_ commit: TGSPlaybackCoordinator.ViewEntry.PendingCommit) {
+        guard self.currentGeneration() == commit.generation else { return }
+
+        if let cgImage = commit.cgImage {
+            // Wrap defensively: nested CATransactions are cheap, and this lets the same
+            // code path serve both the coordinator-driven case and the eager first-frame
+            // case without callers needing to know which is which.
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.layer.contents = cgImage
+            CATransaction.commit()
+        }
+        self.currentFrameIndex = commit.frameIndex
+        self.currentFrameCount = commit.totalFrames
+        self.currentFrameRate = commit.frameRate
+        self.frameUpdated(commit.frameIndex, commit.totalFrames)
+
+        if !self.hasSubmittedFirstFrame {
+            self.hasSubmittedFirstFrame = true
+            self.started()
+            self.delegate?.tgsPlayerViewDidLoadFirstFrame(self)
+            self.updateSilhouetteVisibility(animated: true)
+        }
+
+        if commit.isLast {
+            var shouldStop = false
+            switch self.playbackMode {
+            case .once, .still:
+                shouldStop = true
+            case let .count(count):
+                shouldStop = count <= 1
+                if count > 1 {
+                    self.playbackMode = .count(count - 1)
+                }
+            case .loop:
+                shouldStop = self.stopAtNearestLoop
+            }
+            self.completed(shouldStop)
+            if shouldStop {
+                self.stop()
+            }
+        }
+    }
+
+    /// `workQueue` only. Advance `skipFrames` frames without rendering, then render the next
+    /// frame and return a `PendingCommit` ready for the main thread to apply.
+    private func makeCommitOnWorkQueue(
+        skipFrames: Int,
+        generation: UInt64
+    ) -> TGSPlaybackCoordinator.ViewEntry.PendingCommit? {
+        guard let frameQueue else { return nil }
         if skipFrames > 0, let frameSource {
             // Drain skipped frames cheaply (no rlottie render, no CGImage creation).
             for _ in 0..<skipFrames {
                 _ = frameSource.takeFrame(draw: false)
             }
         }
-        guard let frame = frameQueue.take(draw: true) else { return }
+        guard let frame = frameQueue.take(draw: true) else { return nil }
         // With queue length 1 there is no next-frame prefetch; keep the call for when length grows.
         frameQueue.generateFramesIfNeeded()
 
-        let cgImage = Self.makeCGImage(from: frame)
-        let frameRate = frameSource?.frameRate ?? 0
-        let isLast = frame.isLastFrame
-        let frameIndex = frame.index
-        let totalFrames = frame.totalFrames
-
-        // Snapshot the few flags we actually need on the main thread, then dispatch a small,
-        // tight commit. The goal is to keep this main-thread closure under a few hundred
-        // nanoseconds in steady state so 100+ visible cells don't saturate the main RunLoop.
-        let firstFrameThisRun = !hasSubmittedFirstFrameOnWorkQueue
-        if firstFrameThisRun {
-            hasSubmittedFirstFrameOnWorkQueue = true
-        }
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            guard self.currentGeneration() == generation else { return }
-
-            if let cgImage {
-                CATransaction.begin()
-                CATransaction.setDisableActions(true)
-                self.layer.contents = cgImage
-                CATransaction.commit()
-            }
-            self.currentFrameIndex = frameIndex
-            self.currentFrameCount = totalFrames
-            self.currentFrameRate = frameRate
-            self.frameUpdated(frameIndex, totalFrames)
-
-            if firstFrameThisRun, !self.hasSubmittedFirstFrame {
-                self.hasSubmittedFirstFrame = true
-                self.started()
-                self.delegate?.tgsPlayerViewDidLoadFirstFrame(self)
-                self.updateSilhouetteVisibility(animated: true)
-            }
-
-            if isLast {
-                var shouldStop = false
-                switch self.playbackMode {
-                case .once, .still:
-                    shouldStop = true
-                case let .count(count):
-                    shouldStop = count <= 1
-                    if count > 1 {
-                        self.playbackMode = .count(count - 1)
-                    }
-                case .loop:
-                    shouldStop = self.stopAtNearestLoop
-                }
-                self.completed(shouldStop)
-                if shouldStop {
-                    self.stop()
-                }
-            }
-        }
+        return TGSPlaybackCoordinator.ViewEntry.PendingCommit(
+            cgImage: Self.makeCGImage(from: frame),
+            frameIndex: frame.index,
+            totalFrames: frame.totalFrames,
+            isLast: frame.isLastFrame,
+            frameRate: frameSource?.frameRate ?? 0,
+            generation: generation
+        )
     }
-
-    /// `workQueue` only. Mirrors `hasSubmittedFirstFrame` but lives off-main so the first-frame
-    /// transition (delegate + silhouette fade) is scheduled exactly once even under fast cell reuse.
-    private var hasSubmittedFirstFrameOnWorkQueue: Bool = false
 
     /// `workQueue` only.
     private func seekToOnWorkQueue(
