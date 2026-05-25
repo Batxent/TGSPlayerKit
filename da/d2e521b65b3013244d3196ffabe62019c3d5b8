@@ -1,0 +1,19 @@
+PERFORMANCE_ROADMAP.md
+  s_227146c36eac82::t_30eb16b1c12cc9 1-370
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "dad2e521b65b3013244d3196ffabe62019c3d5b8",
+  "prompts": {},
+  "sessions": {
+    "s_227146c36eac82": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "daf56d41-ff4f-47f9-ae53-e8c134cedb1b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "tommy <batxent@me.com>"
+    }
+  }
+}
