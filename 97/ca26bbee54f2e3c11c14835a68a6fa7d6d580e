@@ -1,0 +1,36 @@
+Sources/TGSPlayerKit/TGSCachedFramesPath.swift
+  s_227146c36eac82::t_b670636c0a29d5 1-78
+Sources/TGSPlayerKit/TGSPlayerView.swift
+  s_227146c36eac82::t_8589d5ce91d806 115-120
+  s_227146c36eac82::t_95acc86833d043 464-467
+  s_227146c36eac82::t_ad49ebaa1f9b10 268-271,274-302,305-338,340-366,369-376,379-381,383-397,404-454
+Sources/TGSPlayerKit/TGSAnimatedStickerCachedFrameSource.swift
+  s_227146c36eac82::t_58521199dfd741 314-321,365-373,376,378,422,427,432,435-445,447-448,450,453
+Tests/TGSPlayerKitTests/TGSCachedFrameGeneratorTests.swift
+  s_227146c36eac82::t_1db16c6a5908ae 1-179,183-249
+  s_227146c36eac82::t_df1b7b2aae3011 180-182
+Tests/TGSPlayerKitTests/TGSAnimatedStickerLocalFileSourceTests.swift
+  s_227146c36eac82::t_2be1caaf559862 1-109
+Sources/TGSPlayerKit/TGSCachedFrameGenerator.swift
+  s_227146c36eac82::t_03d11113a3df2e 1-221
+Tests/TGSPlayerKitTests/TGSCachedFramesPathTests.swift
+  s_227146c36eac82::t_5a23dfd2402329 1-74
+Sources/TGSPlayerKit/TGSAnimatedStickerSource.swift
+  s_227146c36eac82::t_348cf9926825b1 27-42,44-45,48-56,58-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.1",
+  "base_commit_sha": "97ca26bbee54f2e3c11c14835a68a6fa7d6d580e",
+  "prompts": {},
+  "sessions": {
+    "s_227146c36eac82": {
+      "agent_id": {
+        "tool": "cursor",
+        "id": "daf56d41-ff4f-47f9-ae53-e8c134cedb1b",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "tommy <batxent@me.com>"
+    }
+  }
+}
