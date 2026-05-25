@@ -311,9 +311,14 @@ public final class TGSAnimatedStickerCachedFrameSource: TGSAnimatedStickerFrameS
 public struct TGSAnimatedStickerCacheWriter {
     public init() {}
 
-    /// Writes a `.tgsc` cache file at `url`. Atomic: bytes are first written to a
-    /// sibling `.tmp` file and then `rename(2)`-d into place on success, so partial
-    /// writes can never be picked up by the reader.
+    /// Writes a `.tgsc` cache file at `url`. Atomic via `Data.write(to:options:.atomic)` —
+    /// the system performs a tmp-write + rename under the hood, so a partial write
+    /// can never be picked up by the reader.
+    ///
+    /// The whole encoded cache is assembled in memory first. Sticker caches are small
+    /// (typical 96x96 30-frame sticker is well under 1 MB on disk), so the savings
+    /// from streaming directly to a `FileHandle` aren't worth the iOS-13.0 API gymnastics
+    /// `FileHandle.write(contentsOf:)` would require (only available iOS 13.4+).
     ///
     /// Pass a *fresh* source (one that has not yet emitted any frames). The writer
     /// rewinds it to frame 0 before reading, so a source mid-playback will work but
@@ -344,36 +349,6 @@ public struct TGSAnimatedStickerCacheWriter {
             throw TGSPlayerError.cachedSourceProducedNoFrames
         }
 
-        let tmpURL = url.appendingPathExtension("tmp")
-        try? FileManager.default.removeItem(at: tmpURL)
-        guard FileManager.default.createFile(atPath: tmpURL.path, contents: nil) else {
-            throw TGSPlayerError.cachedWriteFailed
-        }
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forWritingTo: tmpURL)
-        } catch {
-            throw TGSPlayerError.cachedWriteFailed
-        }
-        // The handle MUST be closed before we rename the file; if we throw partway
-        // through, this guard scrubs the temp file too.
-        var renamed = false
-        defer {
-            try? handle.close()
-            if !renamed {
-                try? FileManager.default.removeItem(at: tmpURL)
-            }
-        }
-
-        // Reserve header + index table; we patch real values back in at the end.
-        let indexTableSize = frameCount * TGSCachedFrameFormat.indexEntrySize
-        let reservedPrefixSize = TGSCachedFrameFormat.headerSize + indexTableSize
-        do {
-            try handle.write(contentsOf: Data(count: reservedPrefixSize))
-        } catch {
-            throw TGSPlayerError.cachedWriteFailed
-        }
-
         let previousBuffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)
         memset(previousBuffer, 0, byteCount)
         let deltaBuffer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)
@@ -387,12 +362,20 @@ public struct TGSAnimatedStickerCacheWriter {
             compressedBuffer.deallocate()
         }
 
+        // Pre-size the output buffer. Header + index table sizes are exact; for the
+        // payload we estimate ~1/3 of raw frame bytes (XOR delta + LZFSE typically
+        // compresses to that). Worst case we just resize on the fly — Data grows
+        // amortized.
+        let indexTableSize = frameCount * TGSCachedFrameFormat.indexEntrySize
+        let prefixSize = TGSCachedFrameFormat.headerSize + indexTableSize
+        var payload = Data()
+        payload.reserveCapacity(prefixSize + (byteCount * frameCount) / 3)
+
         var offsets: [(offset: UInt32, size: UInt32)] = []
         offsets.reserveCapacity(frameCount)
-        var cursor: UInt32 = UInt32(reservedPrefixSize)
+        var cursor: UInt32 = UInt32(prefixSize)
 
-        // Helper closure to encode + write one already-extracted frame.
-        let writeFrame: (TGSAnimatedStickerFrame) throws -> Void = { frame in
+        let encodeFrame: (TGSAnimatedStickerFrame) throws -> Void = { frame in
             guard frame.type == .argb,
                   frame.width == width,
                   frame.height == height,
@@ -436,53 +419,38 @@ public struct TGSAnimatedStickerCacheWriter {
             guard written > 0 else {
                 throw TGSPlayerError.cachedWriteFailed
             }
-            let blob = Data(bytes: compressedBuffer, count: written)
-            do {
-                try handle.write(contentsOf: blob)
-            } catch {
-                throw TGSPlayerError.cachedWriteFailed
-            }
+            payload.append(compressedBuffer, count: written)
             offsets.append((offset: cursor, size: UInt32(written)))
             cursor = cursor &+ UInt32(written)
         }
 
-        try writeFrame(firstFrame)
+        try encodeFrame(firstFrame)
         for _ in 1..<frameCount {
             guard let frame = source.takeFrame(draw: true) else {
                 throw TGSPlayerError.cachedSourceProducedNoFrames
             }
-            try writeFrame(frame)
+            try encodeFrame(frame)
         }
 
-        // -- Patch header + index table --
-        var header = Data(capacity: reservedPrefixSize)
-        header.append(contentsOf: TGSCachedFrameFormat.magicBytes)
-        appendU32LE(TGSCachedFrameFormat.currentVersion, to: &header)
-        appendU32LE(UInt32(width), to: &header)
-        appendU32LE(UInt32(height), to: &header)
-        appendU32LE(UInt32(bytesPerRow), to: &header)
-        appendU32LE(UInt32(frameRate), to: &header)
-        appendU32LE(UInt32(frameCount), to: &header)
-        appendU32LE(0, to: &header)
+        // -- Header + index table --
+        var prefix = Data()
+        prefix.reserveCapacity(prefixSize)
+        prefix.append(contentsOf: TGSCachedFrameFormat.magicBytes)
+        appendU32LE(TGSCachedFrameFormat.currentVersion, to: &prefix)
+        appendU32LE(UInt32(width), to: &prefix)
+        appendU32LE(UInt32(height), to: &prefix)
+        appendU32LE(UInt32(bytesPerRow), to: &prefix)
+        appendU32LE(UInt32(frameRate), to: &prefix)
+        appendU32LE(UInt32(frameCount), to: &prefix)
+        appendU32LE(0, to: &prefix)
         for entry in offsets {
-            appendU32LE(entry.offset, to: &header)
-            appendU32LE(entry.size, to: &header)
+            appendU32LE(entry.offset, to: &prefix)
+            appendU32LE(entry.size, to: &prefix)
         }
+        prefix.append(payload)
 
         do {
-            try handle.seek(toOffset: 0)
-            try handle.write(contentsOf: header)
-            try handle.close()  // explicit close so the rename sees flushed bytes
-        } catch {
-            throw TGSPlayerError.cachedWriteFailed
-        }
-
-        do {
-            // Best-effort: remove any existing file at `url` first so the rename
-            // succeeds across filesystems that don't atomically replace.
-            try? FileManager.default.removeItem(at: url)
-            try FileManager.default.moveItem(at: tmpURL, to: url)
-            renamed = true
+            try prefix.write(to: url, options: [.atomic])
         } catch {
             throw TGSPlayerError.cachedWriteFailed
         }

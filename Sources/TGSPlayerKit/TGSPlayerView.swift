@@ -112,6 +112,12 @@ public final class TGSPlayerView: UIView {
     private var stateMachine = TGSPlayerStateMachine()
     private var visibilityGate = TGSAnimatedStickerVisibilityGate()
     private var sourceCancellable: TGSCancellable?
+    /// In-flight cache *write* for `.cached` mode's first-play fallback path. Separate
+    /// from `sourceCancellable` because cancelling it only unsubscribes our handler —
+    /// the underlying `TGSCachedFrameGenerator` task keeps going and finishes writing
+    /// the `.tgsc` file, which is exactly what we want so the next play hits the fast
+    /// path even if this cell scrolled away mid-write.
+    private var cacheGenerationCancellable: TGSCancellable?
     private var playbackMode: TGSAnimatedStickerPlaybackMode = .loop
     private var mode: TGSAnimatedStickerMode = .direct(cachePathPrefix: nil)
     /// Created on demand for the legacy `submitFrame(_:)` / `setOverlayColor` paths.
@@ -259,54 +265,193 @@ public final class TGSPlayerView: UIView {
         self.mode = mode
         updateSilhouetteVisibility(animated: false)
 
+        // `reset()` already called `bumpGeneration()`. Capture `generation`; later
+        // `workQueue` work and main-thread commits use it to drop stale results.
+        let generation = currentGeneration()
+
         switch mode {
         case .cached:
-            sourceCancellable = source.cachedDataPath(width: width, height: height) { _ in
-            }
-        case .direct:
-            // `reset()` already called `bumpGeneration()`. Capture `generation`; later
-            // `workQueue` work and main-thread commits use it to drop stale results.
-            let generation = currentGeneration()
-            // Capture `animationLoader` on the main thread (callers may swap it between setups).
-            let animationLoader = self.animationLoader
-            sourceCancellable = source.directDataPath(attemptSynchronously: false) { [weak self] path in
-                guard let self, let path else { return }
+            sourceCancellable = source.cachedDataPath(width: width, height: height) { [weak self] result in
+                guard let self else { return }
                 guard self.currentGeneration() == generation else { return }
-                self.workQueue.async { [weak self] in
-                    guard let self else { return }
-                    guard self.currentGeneration() == generation else { return }
-                    // mmap → gzip decode → rlottie load all run on `workQueue` (parallel across
-                    // views thanks to the concurrent `renderPool` target). A shared
-                    // `LottieInstance` cache inside the loader collapses N identical loads to 1.
-                    guard let data = try? Data(
-                        contentsOf: URL(fileURLWithPath: path),
-                        options: [.mappedRead]
-                    ) else { return }
-                    guard let loaded = TGSAnimatedStickerDirectFrameSource(
-                        data: data,
+                if let result, result.complete {
+                    // Cache file is on disk and the source says it's complete.
+                    // Try the fast path; if the file is corrupt or sized for a
+                    // different (width, height), wipe it and fall through to direct.
+                    self.openCachedSourceOrFallbackToDirect(
+                        source: source,
+                        cachePath: result.path,
                         width: width,
                         height: height,
-                        cacheKey: path,
-                        loader: animationLoader
-                    ) else { return }
-                    guard self.currentGeneration() == generation else { return }
-                    self.frameSource = loaded
-                    self.frameQueue = TGSAnimatedStickerFrameQueue(length: 1, source: loaded)
+                        playbackMode: playbackMode,
+                        generation: generation
+                    )
+                } else {
+                    // Either the source can't suggest a cache path (`nil`) or the file
+                    // isn't there yet. Render direct now for immediate playback, and if
+                    // we *do* have a target path, fire off background cache generation
+                    // so the next play (or another view's request) hits fast path.
+                    self.sourceCancellable = self.loadDirect(
+                        source: source,
+                        width: width,
+                        height: height,
+                        playbackMode: playbackMode,
+                        generation: generation,
+                        cacheWritePath: result?.path
+                    )
+                }
+            }
+        case .direct:
+            sourceCancellable = loadDirect(
+                source: source,
+                width: width,
+                height: height,
+                playbackMode: playbackMode,
+                generation: generation,
+                cacheWritePath: nil
+            )
+        }
+    }
 
-                    // Read main-thread-owned flags (`isPlaying`, `autoplay`, `automaticallyLoadFirstFrame`);
-                    // hop back to the main queue to decide whether to start playback.
+    /// Drives the "load `.tgs` via the source → mmap → build
+    /// `TGSAnimatedStickerDirectFrameSource` → install" pipeline. Used by both
+    /// `.direct` mode and `.cached`'s first-play fallback.
+    ///
+    /// When `cacheWritePath` is non-nil the same mapped `.tgs` data is also handed
+    /// off to `TGSCachedFrameGenerator.shared` for a fire-and-forget background
+    /// write so the next request at this `(source, width, height)` hits the fast path.
+    private func loadDirect(
+        source: TGSAnimatedStickerSource,
+        width: Int,
+        height: Int,
+        playbackMode: TGSAnimatedStickerPlaybackMode,
+        generation: UInt64,
+        cacheWritePath: String?
+    ) -> TGSCancellable {
+        // Capture `animationLoader` on the calling thread (callers may swap it between
+        // setups, and we need the value that was active at the time of this load).
+        let animationLoader = self.animationLoader
+        return source.directDataPath(attemptSynchronously: false) { [weak self] path in
+            guard let self, let path else { return }
+            guard self.currentGeneration() == generation else { return }
+            self.workQueue.async { [weak self] in
+                guard let self else { return }
+                guard self.currentGeneration() == generation else { return }
+                // mmap → gzip decode → rlottie load all run on `workQueue` (parallel across
+                // views thanks to the concurrent `renderPool` target). A shared
+                // `LottieInstance` cache inside the loader collapses N identical loads to 1.
+                guard let data = try? Data(
+                    contentsOf: URL(fileURLWithPath: path),
+                    options: [.mappedRead]
+                ) else { return }
+                guard let loaded = TGSAnimatedStickerDirectFrameSource(
+                    data: data,
+                    width: width,
+                    height: height,
+                    cacheKey: path,
+                    loader: animationLoader
+                ) else { return }
+                guard self.currentGeneration() == generation else { return }
+                self.frameSource = loaded
+                self.frameQueue = TGSAnimatedStickerFrameQueue(length: 1, source: loaded)
+
+                // Schedule background cache generation if the caller wants the
+                // `.tgsc` written for next time. The generator dedupes by path, so
+                // N views in a list rendering the same sticker only do this once.
+                if let cacheWritePath {
+                    let generatorCacheKey = (source as? TGSAnimatedStickerLocalFileSource)?.cacheKey ?? path
+                    let cancellable = TGSCachedFrameGenerator.shared.generate(
+                        tgsData: data,
+                        cachePath: cacheWritePath,
+                        cacheKey: generatorCacheKey,
+                        width: width,
+                        height: height,
+                        loader: animationLoader,
+                        completionQueue: .main
+                    ) { _ in
+                        // Result is irrelevant to the foreground render: success means
+                        // the next play is fast, failure means the next play just goes
+                        // through this same `loadDirect` path again. Either way, no
+                        // user-visible change to this play.
+                    }
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
-                        guard self.currentGeneration() == generation else { return }
-                        if case let .still(position) = playbackMode {
-                            self.seekTo(position)
-                        } else if self.isPlaying || self.autoplay {
-                            self.play()
-                        } else if self.automaticallyLoadFirstFrame {
-                            self.play(firstFrame: true, fromIndex: nil)
+                        guard self.currentGeneration() == generation else {
+                            cancellable.cancel()
+                            return
                         }
+                        self.cacheGenerationCancellable = cancellable
                     }
                 }
+
+                // Read main-thread-owned flags (`isPlaying`, `autoplay`, `automaticallyLoadFirstFrame`);
+                // hop back to the main queue to decide whether to start playback.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    guard self.currentGeneration() == generation else { return }
+                    if case let .still(position) = playbackMode {
+                        self.seekTo(position)
+                    } else if self.isPlaying || self.autoplay {
+                        self.play()
+                    } else if self.automaticallyLoadFirstFrame {
+                        self.play(firstFrame: true, fromIndex: nil)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tries to open the cache file at `cachePath` as a `TGSAnimatedStickerCachedFrameSource`.
+    /// On any failure (file missing, corrupt magic, version mismatch, wrong baked dims)
+    /// the file is removed and the load falls back to `loadDirect(...)` which will
+    /// regenerate the cache as a side effect.
+    private func openCachedSourceOrFallbackToDirect(
+        source: TGSAnimatedStickerSource,
+        cachePath: String,
+        width: Int,
+        height: Int,
+        playbackMode: TGSAnimatedStickerPlaybackMode,
+        generation: UInt64
+    ) {
+        workQueue.async { [weak self] in
+            guard let self else { return }
+            guard self.currentGeneration() == generation else { return }
+
+            if let cached = try? TGSAnimatedStickerCachedFrameSource(cachePath: cachePath),
+               cached.width == width,
+               cached.height == height {
+                guard self.currentGeneration() == generation else { return }
+                self.frameSource = cached
+                self.frameQueue = TGSAnimatedStickerFrameQueue(length: 1, source: cached)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    guard self.currentGeneration() == generation else { return }
+                    if case let .still(position) = playbackMode {
+                        self.seekTo(position)
+                    } else if self.isPlaying || self.autoplay {
+                        self.play()
+                    } else if self.automaticallyLoadFirstFrame {
+                        self.play(firstFrame: true, fromIndex: nil)
+                    }
+                }
+                return
+            }
+
+            // Cache file unusable (missing / corrupt / wrong dims). Remove it so the
+            // background regenerate from `loadDirect` writes a fresh one rather than
+            // hitting "file exists, skip" on the writer's atomic-rename path.
+            try? FileManager.default.removeItem(atPath: cachePath)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard self.currentGeneration() == generation else { return }
+                self.sourceCancellable = self.loadDirect(
+                    source: source,
+                    width: width,
+                    height: height,
+                    playbackMode: playbackMode,
+                    generation: generation,
+                    cacheWritePath: cachePath
+                )
             }
         }
     }
@@ -316,6 +461,10 @@ public final class TGSPlayerView: UIView {
         bumpGeneration()
         sourceCancellable?.cancel()
         sourceCancellable = nil
+        // Cancelling the generator handler only drops our completion; the underlying
+        // writer keeps going so the cache still lands on disk for the next play.
+        cacheGenerationCancellable?.cancel()
+        cacheGenerationCancellable = nil
         currentFrameIndex = 0
         currentFrameCount = 0
         currentFrameRate = 0
