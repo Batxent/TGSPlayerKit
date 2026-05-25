@@ -22,13 +22,24 @@ final class DemoProjectScaffoldTests: XCTestCase {
         XCTAssertTrue(viewControllerText.contains("stressProfiles"))
     }
 
-    func testPlayerTimerRunsInCommonModesForScrollingPlayback() throws {
+    func testPlayerTimerRunsOffMainQueueForScrollingPlayback() throws {
         let root = packageRoot()
         let playerView = root.appendingPathComponent("Sources/TGSPlayerKit/TGSPlayerView.swift")
 
         let playerViewText = try String(contentsOf: playerView)
-        XCTAssertTrue(playerViewText.contains("RunLoop.main.add(timer, forMode: .common)"))
-        XCTAssertFalse(playerViewText.contains("Timer.scheduledTimer"))
+        // Scrolling-friendly playback requires the per-frame tick to live off the main
+        // RunLoop entirely, so UITrackingRunLoopMode can't starve the animation. A
+        // background DispatchSource timer targeted at the per-view workQueue (which
+        // itself targets the concurrent render pool) trivially satisfies this — much more
+        // robust than the legacy Timer.scheduledTimer + RunLoop.main approach.
+        XCTAssertTrue(
+            playerViewText.contains("DispatchSource.makeTimerSource(queue: workQueue)"),
+            "Playback timer must be a DispatchSourceTimer on the per-view workQueue"
+        )
+        XCTAssertFalse(
+            playerViewText.contains("Timer.scheduledTimer"),
+            "Main-RunLoop timers stall under UITrackingRunLoopMode and must not be used"
+        )
     }
 
     private func packageRoot() -> URL {

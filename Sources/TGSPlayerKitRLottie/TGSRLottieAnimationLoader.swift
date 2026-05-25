@@ -11,6 +11,13 @@ public final class TGSRLottieAnimationLoader: TGSLottieAnimationLoading {
         colorReplacements: [UInt32: UInt32]?,
         cacheKey: String
     ) throws -> TGSPlayerKit.TGSLottieAnimationInstance {
+        // Note: rlottie keeps an in-process model cache keyed by `cacheKey` (see
+        // `rlottie::configureModelCacheSize`). When 60 cells of the same sticker load with
+        // the same cacheKey, the heavy JSON → animation-tree parse runs once and subsequent
+        // loads return the already-parsed model. We deliberately do NOT share the resulting
+        // `TGSLottieInstance` objects across views: each `rlottie::Animation` carries
+        // mutable per-instance renderer state (`mRenderer`, frame caches), so concurrent
+        // `renderSync` calls on the same instance from different view workQueues would race.
         guard let instance = TGSLottieInstance(
             data: data,
             fitzModifier: nativeFitzModifier(fitzModifier),
@@ -54,21 +61,27 @@ private final class TGSRLottieAnimationInstance: TGSPlayerKit.TGSLottieAnimation
             throw TGSPlayerError.renderFailed
         }
 
+        // `Data(count:)` zero-fills the buffer before rlottie writes pixels — wasted work,
+        // because `lottie_render` writes every pixel of the destination surface (transparent
+        // areas get 0x00000000). At ~60 cells × 60fps × ~36 KB this is double-digit MB/s of
+        // pointless memory traffic. Allocate raw memory, let rlottie populate it, then wrap
+        // it in a no-copy `Data` whose deallocator hands the buffer back to the system.
         let byteCount = height * bytesPerRow
-        var data = Data(count: byteCount)
-        data.withUnsafeMutableBytes { rawBuffer in
-            guard let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
-                return
+        let pointer = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 16)
+        instance.renderFrame(
+            with: Int32(index),
+            into: pointer.assumingMemoryBound(to: UInt8.self),
+            width: Int32(width),
+            height: Int32(height),
+            bytesPerRow: Int32(bytesPerRow)
+        )
+        return Data(
+            bytesNoCopy: pointer,
+            count: byteCount,
+            deallocator: .custom { pointer, _ in
+                pointer.deallocate()
             }
-            instance.renderFrame(
-                with: Int32(index),
-                into: baseAddress,
-                width: Int32(width),
-                height: Int32(height),
-                bytesPerRow: Int32(bytesPerRow)
-            )
-        }
-        return data
+        )
     }
 }
 

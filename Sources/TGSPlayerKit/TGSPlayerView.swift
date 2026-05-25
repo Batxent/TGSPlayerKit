@@ -1,4 +1,5 @@
 #if canImport(UIKit)
+import QuartzCore
 import UIKit
 
 public protocol TGSPlayerViewDelegate: AnyObject {
@@ -29,7 +30,7 @@ public final class TGSPlayerView: UIView {
     public private(set) var currentFrameRate: Int = 0
 
     public var currentFrameImage: UIImage? {
-        if let image = imageView.image {
+        if let image = _imageView?.image {
             return image
         }
         if let contents = layer.contents, CFGetTypeID(contents as CFTypeRef) == CGImage.typeID {
@@ -73,8 +74,14 @@ public final class TGSPlayerView: UIView {
     }
 
     public var silhouette: TGSStickerSilhouette? {
-        get { silhouetteView.silhouette }
+        get { _silhouetteView?.silhouette }
         set {
+            // Only materialize the shimmer view when the caller actually wants a silhouette.
+            // Listing 60+ cells with no silhouette saves 60 * (CAShapeLayer + CAGradientLayer + ...)
+            // worth of layer tree, layout, and hit-test overhead.
+            if newValue == nil && _silhouetteView == nil {
+                return
+            }
             silhouetteView.setSilhouette(newValue)
             updateSilhouetteVisibility(animated: false)
         }
@@ -88,7 +95,18 @@ public final class TGSPlayerView: UIView {
 
     public var hasRenderedFirstFrame: Bool { hasSubmittedFirstFrame }
 
-    public var silhouetteView: TGSStickerShimmerEffectView { _silhouetteView }
+    /// Lazily materialized; tests rely on accessing this property forcing the view to exist.
+    public var silhouetteView: TGSStickerShimmerEffectView {
+        if let view = _silhouetteView {
+            return view
+        }
+        let view = TGSStickerShimmerEffectView()
+        view.frame = bounds
+        view.isHidden = true
+        _silhouetteView = view
+        addSubview(view)
+        return view
+    }
 
     // MARK: - Main-thread state
     private var stateMachine = TGSPlayerStateMachine()
@@ -96,22 +114,30 @@ public final class TGSPlayerView: UIView {
     private var sourceCancellable: TGSCancellable?
     private var playbackMode: TGSAnimatedStickerPlaybackMode = .loop
     private var mode: TGSAnimatedStickerMode = .direct(cachePathPrefix: nil)
-    private let imageView = UIImageView()
-    private let _silhouetteView = TGSStickerShimmerEffectView()
+    /// Created on demand for the legacy `submitFrame(_:)` / `setOverlayColor` paths.
+    /// The hot rendering path writes directly to `self.layer.contents`, so most cells in
+    /// a long sticker list never pay for an extra `UIImageView` in their hierarchy.
+    private var _imageView: UIImageView?
+    private var _silhouetteView: TGSStickerShimmerEffectView?
     private var hasSubmittedFirstFrame: Bool = false
 
-    // MARK: - sharedQueue-only state
-    /// These fields are read/written **only** on `Self.sharedQueue`; the main thread
-    /// touches them indirectly via dispatched work.
-    /// This avoids releasing `lottie_render` state across threads and keeps heavy work off the main thread.
+    // MARK: - workQueue-only state
+    /// All heavy lifting (file IO, gzip decode, rlottie load, `lottie_render`, `CGImage` creation)
+    /// runs on this view's `workQueue`. Each view owns its own serial `workQueue` that targets
+    /// the module-wide concurrent `renderPool`, so:
+    ///   1. Many sticker views render in parallel (~processor count) — matching Telegram's
+    ///      `Queue.concurrentDefaultQueue()` + per-node serial frame pipeline model.
+    ///   2. A single view's frames are still serialized, because `rlottie::Animation` mutates
+    ///      no shared state across `renderSync` calls only when the caller doesn't interleave
+    ///      operations on a single instance.
     private var frameSource: TGSAnimatedStickerFrameSource?
     private var frameQueue: TGSAnimatedStickerFrameQueue?
     private var playbackTimer: DispatchSourceTimer?
 
     // MARK: - Generation token
-    /// Each `reset()` bumps the token; work on `sharedQueue` compares before committing to the main thread.
+    /// Each `reset()` bumps the token; work on `workQueue` compares before committing to the main thread.
     /// Mismatches are dropped to avoid stale results from cell reuse / tab switches (visual glitches or races).
-    /// Main thread writes and `sharedQueue` reads use a lock for a proper memory barrier.
+    /// Main thread writes and `workQueue` reads use a lock for a proper memory barrier.
     private let generationLock = NSLock()
     private var _setupGeneration: UInt64 = 0
 
@@ -127,14 +153,21 @@ public final class TGSPlayerView: UIView {
         return _setupGeneration
     }
 
-    /// Same idea as telegram-iOS: one module-wide serial `userInteractive` queue.
-    /// File IO, gzip decode, rlottie load, `lottie_render`, and `CGImage` creation run here;
-    /// the main thread only receives dispatched `CGImage`s and assigns `layer.contents`.
-    /// Serial (not concurrent) caps global sticker decode/render concurrency so many cells
-    /// do not all parallelize and drag the main thread.
-    fileprivate static let sharedQueue: DispatchQueue = DispatchQueue(
-        label: "com.tgsplayerkit.shared",
-        qos: .userInteractive
+    /// Module-wide concurrent render pool — the rough UIKit equivalent of Telegram iOS's
+    /// `Queue.concurrentDefaultQueue()`. Per-view serial `workQueue`s target this pool so
+    /// the scheduler can run as many sticker views in parallel as there are CPU cores.
+    fileprivate static let renderPool: DispatchQueue = DispatchQueue(
+        label: "com.tgsplayerkit.render-pool",
+        qos: .userInteractive,
+        attributes: .concurrent
+    )
+
+    /// Per-view serial queue. Created lazily so views that never get a `setup()` don't pay
+    /// for the dispatch queue object. Targets the shared `renderPool` so heavy work fans out.
+    private lazy var workQueue: DispatchQueue = DispatchQueue(
+        label: "com.tgsplayerkit.view",
+        qos: .userInteractive,
+        target: Self.renderPool
     )
 
     public init(
@@ -151,11 +184,6 @@ public final class TGSPlayerView: UIView {
         self.playToCompletionOnStop = configuration.playToCompletionOnStop
         isOpaque = false
         layer.contentsGravity = .resizeAspect
-        imageView.contentMode = .scaleAspectFit
-        imageView.backgroundColor = .clear
-        addSubview(imageView)
-        _silhouetteView.isHidden = true
-        addSubview(_silhouetteView)
     }
 
     @available(*, unavailable)
@@ -164,22 +192,30 @@ public final class TGSPlayerView: UIView {
     }
 
     deinit {
-        // `playbackTimer` / `frameSource` / `frameQueue` are sharedQueue-only.
-        // Tear them down on `sharedQueue` so they are not released while `lottie_render` may still be running.
+        // `playbackTimer` / `frameSource` / `frameQueue` are `workQueue`-only.
+        // Tear them down on `workQueue` so they are not released while `lottie_render` may still be running.
+        let queue = self.workQueue
         let timer = self.playbackTimer
         let source = self.frameSource
-        let queue = self.frameQueue
-        Self.sharedQueue.async {
+        let fq = self.frameQueue
+        queue.async {
             timer?.cancel()
             _ = source
-            _ = queue
+            _ = fq
         }
     }
 
     public override func layoutSubviews() {
         super.layoutSubviews()
-        imageView.frame = bounds
-        _silhouetteView.frame = bounds
+        // Layout passes inside an outer UIView.animate {} block would otherwise pick up
+        // an implicit fade animation on every frame swap. Disable actions here for the
+        // entire sublayer relayout — `layer.contents` writes also run inside their own
+        // disabled-actions transaction below.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        _imageView?.frame = bounds
+        _silhouetteView?.frame = bounds
+        CATransaction.commit()
     }
 
     public override func didMoveToWindow() {
@@ -216,19 +252,19 @@ public final class TGSPlayerView: UIView {
             }
         case .direct:
             // `reset()` already called `bumpGeneration()`. Capture `generation`; later
-            // `sharedQueue` work and main-thread commits use it to drop stale results.
+            // `workQueue` work and main-thread commits use it to drop stale results.
             let generation = currentGeneration()
             // Capture `animationLoader` on the main thread (callers may swap it between setups).
             let animationLoader = self.animationLoader
             sourceCancellable = source.directDataPath(attemptSynchronously: false) { [weak self] path in
                 guard let self, let path else { return }
                 guard self.currentGeneration() == generation else { return }
-                Self.sharedQueue.async { [weak self] in
+                self.workQueue.async { [weak self] in
                     guard let self else { return }
                     guard self.currentGeneration() == generation else { return }
-                    // mmap → gzip decode → rlottie load all run on `sharedQueue`.
-                    // These are the heaviest cold-path steps; on the main thread, many visible cells
-                    // can stall the panel for tens to hundreds of ms.
+                    // mmap → gzip decode → rlottie load all run on `workQueue` (parallel across
+                    // views thanks to the concurrent `renderPool` target). A shared
+                    // `LottieInstance` cache inside the loader collapses N identical loads to 1.
                     guard let data = try? Data(
                         contentsOf: URL(fileURLWithPath: path),
                         options: [.mappedRead]
@@ -272,19 +308,27 @@ public final class TGSPlayerView: UIView {
         currentFrameRate = 0
         isPlaying = false
         hasSubmittedFirstFrame = false
-        imageView.image = nil
+        _imageView?.image = nil
+        // Wrap the contents clear in a no-action transaction so cell reuse doesn't trigger
+        // a cross-fade between the previous sticker's last frame and the new sticker's first.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         layer.contents = nil
+        CATransaction.commit()
         stateMachine.prepareForReuse()
         updateSilhouetteVisibility(animated: false)
 
-        // 2. Release sharedQueue-only state on `sharedQueue`.
+        // 2. Release workQueue-only state on `workQueue`.
         // No generation check here — the next `setup` overwrites in-order on the serial queue; clearing unconditionally is safer.
-        Self.sharedQueue.async { [weak self] in
+        workQueue.async { [weak self] in
             guard let self else { return }
             self.playbackTimer?.cancel()
             self.playbackTimer = nil
             self.frameSource = nil
             self.frameQueue = nil
+            // Mirror the main-thread `hasSubmittedFirstFrame = false` so the next setup's
+            // first frame re-runs the started() / silhouette fade transition exactly once.
+            self.hasSubmittedFirstFrameOnWorkQueue = false
         }
     }
 
@@ -328,10 +372,10 @@ public final class TGSPlayerView: UIView {
         }
 
         let generation = currentGeneration()
-        Self.sharedQueue.async { [weak self] in
+        workQueue.async { [weak self] in
             guard let self else { return }
             guard self.currentGeneration() == generation else { return }
-            self.startPlaybackOnSharedQueue(
+            self.startPlaybackOnWorkQueue(
                 firstFrame: firstFrame,
                 fromIndex: fromIndex,
                 generation: generation
@@ -342,19 +386,19 @@ public final class TGSPlayerView: UIView {
     public func pause() {
         stateMachine.pause()
         delegate?.tgsPlayerViewDidPause(self)
-        cancelPlaybackTimerOnSharedQueue()
+        cancelPlaybackTimerOnWorkQueue()
     }
 
     public func stop() {
         stateMachine.stop()
         isPlaying = false
-        cancelPlaybackTimerOnSharedQueue()
+        cancelPlaybackTimerOnWorkQueue()
     }
 
-    private func cancelPlaybackTimerOnSharedQueue() {
-        // No generation check: cancel is always safe. The serial `sharedQueue` orders
+    private func cancelPlaybackTimerOnWorkQueue() {
+        // No generation check: cancel is always safe. The serial `workQueue` orders
         // chained calls like pause→play; the last enqueued operation wins.
-        Self.sharedQueue.async { [weak self] in
+        workQueue.async { [weak self] in
             guard let self else { return }
             self.playbackTimer?.cancel()
             self.playbackTimer = nil
@@ -363,10 +407,10 @@ public final class TGSPlayerView: UIView {
 
     public func seekTo(_ position: TGSAnimatedStickerPlaybackPosition) {
         let generation = currentGeneration()
-        Self.sharedQueue.async { [weak self] in
+        workQueue.async { [weak self] in
             guard let self else { return }
             guard self.currentGeneration() == generation else { return }
-            self.seekToOnSharedQueue(position, generation: generation)
+            self.seekToOnWorkQueue(position, generation: generation)
         }
     }
 
@@ -398,17 +442,21 @@ public final class TGSPlayerView: UIView {
     }
 
     public func setOverlayColor(_ color: UIColor?, replace: Bool, animated: Bool) {
-        imageView.tintColor = color
-        imageView.image = imageView.image?.withRenderingMode(color == nil ? .alwaysOriginal : .alwaysTemplate)
+        let view = imageView()
+        view.tintColor = color
+        view.image = view.image?.withRenderingMode(color == nil ? .alwaysOriginal : .alwaysTemplate)
     }
 
     /// Legacy hook for pushing a frame directly (rare). Must run on the main thread.
     public func submitFrame(_ image: CGImage) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         layer.contents = image
+        CATransaction.commit()
     }
 
-    /// Legacy API. The internal playback path **does not** use this (`renderTickOnSharedQueue`
-    /// sets `contents` from `sharedQueue`); kept for external one-off static frame submission.
+    /// Legacy API. The internal playback path **does not** use this (`renderTickOnWorkQueue`
+    /// sets `contents` from `workQueue`); kept for external one-off static frame submission.
     public func submitFrame(_ frame: TGSAnimatedStickerFrame) {
         guard frame.type == .argb else {
             return
@@ -416,7 +464,7 @@ public final class TGSPlayerView: UIView {
         guard let image = Self.makeUIImage(from: frame) else {
             return
         }
-        imageView.image = image
+        imageView().image = image
         currentFrameIndex = frame.index
         currentFrameCount = frame.totalFrames
         frameUpdated(frame.index, frame.totalFrames)
@@ -428,10 +476,10 @@ public final class TGSPlayerView: UIView {
         }
     }
 
-    // MARK: - sharedQueue helpers
+    // MARK: - workQueue helpers
 
-    /// `sharedQueue` only. Renders the current frame immediately, then starts a repeating timer if needed.
-    private func startPlaybackOnSharedQueue(
+    /// `workQueue` only. Renders the current frame immediately, then starts a repeating timer if needed.
+    private func startPlaybackOnWorkQueue(
         firstFrame: Bool,
         fromIndex: Int?,
         generation: UInt64
@@ -449,31 +497,43 @@ public final class TGSPlayerView: UIView {
         playbackTimer = nil
 
         // Draw one frame immediately so the first frame appears without waiting for the timer.
-        renderTickOnSharedQueue(generation: generation)
+        renderTickOnWorkQueue(skipFrames: 0, generation: generation)
 
         if firstFrame {
             return
         }
 
         let interval = 1.0 / Double(max(1, frameSource.frameRate))
-        let timer = DispatchSource.makeTimerSource(queue: Self.sharedQueue)
+        let timer = DispatchSource.makeTimerSource(queue: workQueue)
         timer.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(2))
-        timer.setEventHandler { [weak self] in
-            guard let self else { return }
+        timer.setEventHandler { [weak self, weak timer] in
+            guard let self, let timer else { return }
             guard self.currentGeneration() == generation else {
                 self.playbackTimer?.cancel()
                 self.playbackTimer = nil
                 return
             }
-            self.renderTickOnSharedQueue(generation: generation)
+            // `timer.data` is the number of ticks accumulated since the last handler call.
+            // When the render pool falls behind (long lists, thermal throttling), we want to
+            // advance the frame index by the missed count but only render the latest frame —
+            // never burn CPU rendering stale intermediate frames the user will never see.
+            let ticks = max(1, Int(timer.data))
+            self.renderTickOnWorkQueue(skipFrames: ticks - 1, generation: generation)
         }
         playbackTimer = timer
         timer.resume()
     }
 
-    /// `sharedQueue` only. Take one frame → `lottie_render` → build `CGImage` → main thread sets `contents`.
-    private func renderTickOnSharedQueue(generation: UInt64) {
+    /// `workQueue` only. Advance `skipFrames` frames without rendering, then render the next frame
+    /// and hand it to the main thread.
+    private func renderTickOnWorkQueue(skipFrames: Int, generation: UInt64) {
         guard let frameQueue else { return }
+        if skipFrames > 0, let frameSource {
+            // Drain skipped frames cheaply (no rlottie render, no CGImage creation).
+            for _ in 0..<skipFrames {
+                _ = frameSource.takeFrame(draw: false)
+            }
+        }
         guard let frame = frameQueue.take(draw: true) else { return }
         // With queue length 1 there is no next-frame prefetch; keep the call for when length grows.
         frameQueue.generateFramesIfNeeded()
@@ -484,19 +544,30 @@ public final class TGSPlayerView: UIView {
         let frameIndex = frame.index
         let totalFrames = frame.totalFrames
 
+        // Snapshot the few flags we actually need on the main thread, then dispatch a small,
+        // tight commit. The goal is to keep this main-thread closure under a few hundred
+        // nanoseconds in steady state so 100+ visible cells don't saturate the main RunLoop.
+        let firstFrameThisRun = !hasSubmittedFirstFrameOnWorkQueue
+        if firstFrameThisRun {
+            hasSubmittedFirstFrameOnWorkQueue = true
+        }
+
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             guard self.currentGeneration() == generation else { return }
 
             if let cgImage {
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
                 self.layer.contents = cgImage
+                CATransaction.commit()
             }
             self.currentFrameIndex = frameIndex
             self.currentFrameCount = totalFrames
             self.currentFrameRate = frameRate
             self.frameUpdated(frameIndex, totalFrames)
 
-            if !self.hasSubmittedFirstFrame {
+            if firstFrameThisRun, !self.hasSubmittedFirstFrame {
                 self.hasSubmittedFirstFrame = true
                 self.started()
                 self.delegate?.tgsPlayerViewDidLoadFirstFrame(self)
@@ -524,8 +595,12 @@ public final class TGSPlayerView: UIView {
         }
     }
 
-    /// `sharedQueue` only.
-    private func seekToOnSharedQueue(
+    /// `workQueue` only. Mirrors `hasSubmittedFirstFrame` but lives off-main so the first-frame
+    /// transition (delegate + silhouette fade) is scheduled exactly once even under fast cell reuse.
+    private var hasSubmittedFirstFrameOnWorkQueue: Bool = false
+
+    /// `workQueue` only.
+    private func seekToOnWorkQueue(
         _ position: TGSAnimatedStickerPlaybackPosition,
         generation: UInt64
     ) {
@@ -549,14 +624,14 @@ public final class TGSPlayerView: UIView {
 
         // After seek, show the frame at the new position immediately.
         frameQueue = TGSAnimatedStickerFrameQueue(length: 1, source: frameSource)
-        startPlaybackOnSharedQueue(firstFrame: true, fromIndex: nil, generation: generation)
+        startPlaybackOnWorkQueue(firstFrame: true, fromIndex: nil, generation: generation)
     }
 
     // MARK: - Image creation (thread-safe)
 
     /// Safe from any thread; does not retain `self`.
     /// Each `lottie_render` yields `Data` backed by an independent buffer, so the next frame
-    /// on `sharedQueue` cannot overwrite pixels already handed off to the main thread as a `CGImage`.
+    /// on `workQueue` cannot overwrite pixels already handed off to the main thread as a `CGImage`.
     private static func makeCGImage(from frame: TGSAnimatedStickerFrame) -> CGImage? {
         guard frame.type == .argb else {
             return nil
@@ -579,7 +654,9 @@ public final class TGSPlayerView: UIView {
             bitmapInfo: bitmapInfo,
             provider: provider,
             decode: nil,
-            shouldInterpolate: true,
+            // Rendered at exact pixel size of the player view; CoreGraphics interpolation
+            // would just add per-frame GPU sampling cost for no quality gain.
+            shouldInterpolate: false,
             intent: .defaultIntent
         )
     }
@@ -590,29 +667,50 @@ public final class TGSPlayerView: UIView {
 
     // MARK: - Silhouette / Visibility
 
+    private func imageView() -> UIImageView {
+        if let view = _imageView {
+            return view
+        }
+        let view = UIImageView()
+        view.contentMode = .scaleAspectFit
+        view.backgroundColor = .clear
+        view.frame = bounds
+        _imageView = view
+        // Insert under any existing silhouette so the shimmer remains on top.
+        if let silhouette = _silhouetteView {
+            insertSubview(view, belowSubview: silhouette)
+        } else {
+            addSubview(view)
+        }
+        return view
+    }
+
     private func updateSilhouetteVisibility(animated: Bool) {
+        // No silhouette view ever materialized → nothing to show / hide. This is the common
+        // path for non-silhouette stickers and we deliberately avoid creating the view here.
+        guard let silhouetteView = _silhouetteView else { return }
+
         let shouldShow = showsSilhouetteUntilFirstFrame
-            && _silhouetteView.silhouette != nil
+            && silhouetteView.silhouette != nil
             && !hasSubmittedFirstFrame
 
         if shouldShow {
-            bringSubviewToFront(_silhouetteView)
-            _silhouetteView.alpha = 1
-            _silhouetteView.isHidden = false
-            _silhouetteView.startAnimating()
+            bringSubviewToFront(silhouetteView)
+            silhouetteView.alpha = 1
+            silhouetteView.isHidden = false
+            silhouetteView.startAnimating()
             return
         }
 
-        guard !_silhouetteView.isHidden else {
-            _silhouetteView.stopAnimating()
+        guard !silhouetteView.isHidden else {
+            silhouetteView.stopAnimating()
             return
         }
 
-        let finalize: () -> Void = { [weak self] in
-            guard let self else { return }
-            self._silhouetteView.isHidden = true
-            self._silhouetteView.alpha = 1
-            self._silhouetteView.stopAnimating()
+        let finalize: () -> Void = { [weak silhouetteView] in
+            silhouetteView?.isHidden = true
+            silhouetteView?.alpha = 1
+            silhouetteView?.stopAnimating()
         }
 
         if animated, silhouetteFadeOutDuration > 0 {
@@ -620,8 +718,8 @@ public final class TGSPlayerView: UIView {
                 withDuration: silhouetteFadeOutDuration,
                 delay: 0,
                 options: [.beginFromCurrentState, .allowUserInteraction],
-                animations: { [weak self] in
-                    self?._silhouetteView.alpha = 0
+                animations: { [weak silhouetteView] in
+                    silhouetteView?.alpha = 0
                 },
                 completion: { _ in finalize() }
             )

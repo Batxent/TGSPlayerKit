@@ -81,6 +81,11 @@ public struct TGSDecoder {
             defer { outputBuffer.deallocate() }
 
             var output = Data()
+            // gzip-compressed Lottie JSON typically expands ~6–10× (lots of repeated keys
+            // and floats). Reserving 4× up front gets us through most stickers in a single
+            // allocation instead of the 7+ amortized reallocations Data.append would do.
+            let initialCapacity = min(maxDecodedBytes, max(chunkSize, data.count * 4))
+            output.reserveCapacity(initialCapacity)
 
             while true {
                 stream.next_out = outputBuffer
