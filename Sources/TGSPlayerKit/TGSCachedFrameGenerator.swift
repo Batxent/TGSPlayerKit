@@ -15,11 +15,11 @@ import Foundation
 /// in-flight map deduplicates concurrent requests for the same destination path,
 /// fanning the single generation result out to every waiting completion.
 ///
-/// Cancellation removes a handler but does NOT abort the underlying generation. By the
-/// time a cell scrolls offscreen and "cancels", the generator may already be most of
-/// the way through; throwing away the work would just mean the next play has to start
-/// over. Letting it finish writes the cache to disk so the next play (or the next
-/// time *any* view requests this sticker) hits the fast path.
+/// Cancellation removes a handler. If every handler cancels before the queued task
+/// starts, that task is dropped so invisible/reused cells cannot build a long backlog
+/// that competes with foreground first-frame rendering. Once generation has started we
+/// still let it finish, because aborting halfway would waste work and leave no cache
+/// file for the next play.
 public final class TGSCachedFrameGenerator {
     /// Process-wide singleton. Sticker rendering is intrinsically a process-level
     /// concern — there's only one rlottie, one CPU pool, one filesystem cache dir.
@@ -53,8 +53,8 @@ public final class TGSCachedFrameGenerator {
     ///   this call attaches to it; both completions fire with the same result.
     /// - Otherwise a new generation is enqueued on the shared background queue.
     ///
-    /// The returned `TGSCancellable` only unsubscribes this handler; the underlying
-    /// generation continues so the resulting file can serve future requests.
+    /// The returned `TGSCancellable` unsubscribes this handler. If all handlers
+    /// unsubscribe before this task starts, the queued generation is skipped.
     @discardableResult
     public func generate(
         tgsData: Data,
@@ -68,6 +68,7 @@ public final class TGSCachedFrameGenerator {
     ) -> TGSCancellable {
         // Fast path: file already on disk. Don't bother locking or dispatching.
         if FileManager.default.fileExists(atPath: cachePath) {
+            TGSDebugLog("cache-hit path=\(TGSDebugFileName(cachePath)) size=\(width)x\(height)")
             completionQueue.async {
                 completion(.success(URL(fileURLWithPath: cachePath)))
             }
@@ -82,7 +83,9 @@ public final class TGSCachedFrameGenerator {
         lock.lock()
         if let existing = inFlight[cachePath] {
             existing.attach(handler)
+            let handlerCount = existing.handlerCount
             lock.unlock()
+            TGSDebugLog("cache-attach path=\(TGSDebugFileName(cachePath)) size=\(width)x\(height) handlers=\(handlerCount)")
             return Token { [weak self] in
                 self?.detach(handler, from: cachePath)
             }
@@ -91,12 +94,17 @@ public final class TGSCachedFrameGenerator {
         task.attach(handler)
         inFlight[cachePath] = task
         lock.unlock()
+        TGSDebugLog("cache-enqueue path=\(TGSDebugFileName(cachePath)) size=\(width)x\(height) bytes=\(tgsData.count)")
 
         // Capture only POD + protocol values into the closure (no `self`-mutating
         // state) so cancellation of the originating call can't accidentally abort
         // the work mid-stream.
-        workQueue.async { [weak self] in
+        workQueue.async { [weak self, weak task] in
             guard let self else { return }
+            guard let task, self.markTaskStarted(task, cachePath: cachePath) else {
+                TGSDebugLog("cache-start-skipped path=\(TGSDebugFileName(cachePath)) size=\(width)x\(height)")
+                return
+            }
             self.runGeneration(
                 tgsData: tgsData,
                 cachePath: cachePath,
@@ -116,9 +124,27 @@ public final class TGSCachedFrameGenerator {
     private func detach(_ handler: Handler, from cachePath: String) {
         lock.lock()
         defer { lock.unlock() }
-        inFlight[cachePath]?.detach(handler)
-        // We deliberately do not remove the task even when handlers.isEmpty —
-        // see class-level comment on cancellation semantics.
+        guard let task = inFlight[cachePath] else { return }
+        task.detach(handler)
+        let handlerCount = task.handlerCount
+        let shouldDrop = task.shouldDropBeforeStart
+        TGSDebugLog("cache-cancel-handler path=\(TGSDebugFileName(cachePath)) handlers=\(handlerCount) dropBeforeStart=\(shouldDrop)")
+        if shouldDrop {
+            inFlight.removeValue(forKey: cachePath)
+            TGSDebugLog("cache-drop-before-start path=\(TGSDebugFileName(cachePath))")
+        }
+    }
+
+    private func markTaskStarted(_ task: PendingTask, cachePath: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard inFlight[cachePath] === task else { return false }
+        guard task.markStartedIfObserved() else {
+            inFlight.removeValue(forKey: cachePath)
+            return false
+        }
+        TGSDebugLog("cache-start path=\(TGSDebugFileName(cachePath)) handlers=\(task.handlerCount)")
+        return true
     }
 
     private func runGeneration(
@@ -129,6 +155,7 @@ public final class TGSCachedFrameGenerator {
         height: Int,
         loader: TGSLottieAnimationLoading
     ) {
+        let startedAt = CFAbsoluteTimeGetCurrent()
         let result: Result<URL, TGSPlayerError>
         // The destination's parent dir might not exist yet on first run.
         let destURL = URL(fileURLWithPath: cachePath)
@@ -161,6 +188,13 @@ public final class TGSCachedFrameGenerator {
         lock.lock()
         let task = inFlight.removeValue(forKey: cachePath)
         lock.unlock()
+        let elapsedMs = Int((CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
+        switch result {
+        case .success:
+            TGSDebugLog("cache-finish-success path=\(TGSDebugFileName(cachePath)) size=\(width)x\(height) elapsedMs=\(elapsedMs)")
+        case let .failure(error):
+            TGSDebugLog("cache-finish-failure path=\(TGSDebugFileName(cachePath)) size=\(width)x\(height) elapsedMs=\(elapsedMs) error=\(error)")
+        }
         task?.fireAll(result)
     }
 }
@@ -182,6 +216,7 @@ private final class Handler {
 private final class PendingTask {
     private let lock = NSLock()
     private var handlers: [Handler] = []
+    private var started = false
 
     func attach(_ handler: Handler) {
         lock.lock(); defer { lock.unlock() }
@@ -191,6 +226,24 @@ private final class PendingTask {
     func detach(_ handler: Handler) {
         lock.lock(); defer { lock.unlock() }
         handlers.removeAll { $0 === handler }
+    }
+
+    var shouldDropBeforeStart: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !started && handlers.isEmpty
+    }
+
+    var handlerCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return handlers.count
+    }
+
+    func markStartedIfObserved() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !handlers.isEmpty else { return false }
+        started = true
+        return true
     }
 
     func fireAll(_ result: Result<URL, TGSPlayerError>) {

@@ -94,6 +94,7 @@ public final class TGSPlayerView: UIView {
     public var silhouetteFadeOutDuration: TimeInterval = 0.25
 
     public var hasRenderedFirstFrame: Bool { hasSubmittedFirstFrame }
+    private var debugID: String { String(describing: ObjectIdentifier(self)) }
 
     /// Lazily materialized; tests rely on accessing this property forcing the view to exist.
     public var silhouetteView: TGSStickerShimmerEffectView {
@@ -264,6 +265,14 @@ public final class TGSPlayerView: UIView {
         self.playbackMode = playbackMode
         self.mode = mode
         updateSilhouetteVisibility(animated: false)
+        let modeName: String
+        switch mode {
+        case .cached:
+            modeName = "cached"
+        case .direct:
+            modeName = "direct"
+        }
+        TGSDebugLog("player-setup id=\(debugID) mode=\(modeName) size=\(width)x\(height) playback=\(playbackMode) visible=\(visibility) displaying=\(window != nil) isPlaying=\(isPlaying)")
 
         // `reset()` already called `bumpGeneration()`. Capture `generation`; later
         // `workQueue` work and main-thread commits use it to drop stale results.
@@ -275,6 +284,7 @@ public final class TGSPlayerView: UIView {
                 guard let self else { return }
                 guard self.currentGeneration() == generation else { return }
                 if let result, result.complete {
+                    TGSDebugLog("player-cache-hit id=\(self.debugID) path=\(TGSDebugFileName(result.path)) size=\(width)x\(height)")
                     // Cache file is on disk and the source says it's complete.
                     // Try the fast path; if the file is corrupt or sized for a
                     // different (width, height), wipe it and fall through to direct.
@@ -287,6 +297,9 @@ public final class TGSPlayerView: UIView {
                         generation: generation
                     )
                 } else {
+                    let status = result == nil ? "no-cache-path" : "cache-miss"
+                    let cachePath = result.map { TGSDebugFileName($0.path) } ?? "nil"
+                    TGSDebugLog("player-cache-miss id=\(self.debugID) status=\(status) path=\(cachePath) size=\(width)x\(height)")
                     // Either the source can't suggest a cache path (`nil`) or the file
                     // isn't there yet. Render direct now for immediate playback, and if
                     // we *do* have a target path, fire off background cache generation
@@ -331,6 +344,7 @@ public final class TGSPlayerView: UIView {
         // Capture `animationLoader` on the calling thread (callers may swap it between
         // setups, and we need the value that was active at the time of this load).
         let animationLoader = self.animationLoader
+        TGSDebugLog("player-load-direct-request id=\(debugID) size=\(width)x\(height) cacheWrite=\(cacheWritePath.map(TGSDebugFileName) ?? "nil")")
         return source.directDataPath(attemptSynchronously: false) { [weak self] path in
             guard let self, let path else { return }
             guard self.currentGeneration() == generation else { return }
@@ -343,23 +357,31 @@ public final class TGSPlayerView: UIView {
                 guard let data = try? Data(
                     contentsOf: URL(fileURLWithPath: path),
                     options: [.mappedRead]
-                ) else { return }
+                ) else {
+                    TGSDebugLog("player-load-direct-read-failed id=\(self.debugID) path=\(TGSDebugFileName(path))")
+                    return
+                }
                 guard let loaded = TGSAnimatedStickerDirectFrameSource(
                     data: data,
                     width: width,
                     height: height,
                     cacheKey: path,
                     loader: animationLoader
-                ) else { return }
+                ) else {
+                    TGSDebugLog("player-load-direct-source-failed id=\(self.debugID) path=\(TGSDebugFileName(path)) size=\(width)x\(height)")
+                    return
+                }
                 guard self.currentGeneration() == generation else { return }
                 self.frameSource = loaded
                 self.frameQueue = TGSAnimatedStickerFrameQueue(length: 1, source: loaded)
+                TGSDebugLog("player-load-direct-ready id=\(self.debugID) path=\(TGSDebugFileName(path)) size=\(width)x\(height) frames=\(loaded.frameCount) fps=\(loaded.frameRate)")
 
                 // Schedule background cache generation if the caller wants the
                 // `.tgsc` written for next time. The generator dedupes by path, so
                 // N views in a list rendering the same sticker only do this once.
                 if let cacheWritePath {
                     let generatorCacheKey = (source as? TGSAnimatedStickerLocalFileSource)?.cacheKey ?? path
+                    TGSDebugLog("player-cache-generate-request id=\(self.debugID) cachePath=\(TGSDebugFileName(cacheWritePath)) size=\(width)x\(height)")
                     let cancellable = TGSCachedFrameGenerator.shared.generate(
                         tgsData: data,
                         cachePath: cacheWritePath,
@@ -377,10 +399,12 @@ public final class TGSPlayerView: UIView {
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
                         guard self.currentGeneration() == generation else {
+                            TGSDebugLog("player-cache-cancellable-stale id=\(self.debugID) cachePath=\(TGSDebugFileName(cacheWritePath))")
                             cancellable.cancel()
                             return
                         }
                         self.cacheGenerationCancellable = cancellable
+                        TGSDebugLog("player-cache-cancellable-attached id=\(self.debugID) cachePath=\(TGSDebugFileName(cacheWritePath))")
                     }
                 }
 
@@ -423,6 +447,7 @@ public final class TGSPlayerView: UIView {
                 guard self.currentGeneration() == generation else { return }
                 self.frameSource = cached
                 self.frameQueue = TGSAnimatedStickerFrameQueue(length: 1, source: cached)
+                TGSDebugLog("player-open-cache-ready id=\(self.debugID) cachePath=\(TGSDebugFileName(cachePath)) size=\(width)x\(height) frames=\(cached.frameCount) fps=\(cached.frameRate)")
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
                     guard self.currentGeneration() == generation else { return }
@@ -440,6 +465,7 @@ public final class TGSPlayerView: UIView {
             // Cache file unusable (missing / corrupt / wrong dims). Remove it so the
             // background regenerate from `loadDirect` writes a fresh one rather than
             // hitting "file exists, skip" on the writer's atomic-rename path.
+            TGSDebugLog("player-open-cache-fallback id=\(self.debugID) cachePath=\(TGSDebugFileName(cachePath)) requested=\(width)x\(height)")
             try? FileManager.default.removeItem(atPath: cachePath)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -458,6 +484,7 @@ public final class TGSPlayerView: UIView {
 
     public func reset() {
         // 1. Clear main-thread state synchronously: UI, state machine, generation.
+        TGSDebugLog("player-reset id=\(debugID) wasPlaying=\(isPlaying) visible=\(visibility) displaying=\(window != nil) frame=\(currentFrameIndex)/\(currentFrameCount)")
         bumpGeneration()
         sourceCancellable?.cancel()
         sourceCancellable = nil
@@ -515,6 +542,7 @@ public final class TGSPlayerView: UIView {
     }
 
     public func play(firstFrame: Bool, fromIndex: Int?) {
+        TGSDebugLog("player-play id=\(debugID) firstFrame=\(firstFrame) from=\(fromIndex.map(String.init) ?? "nil") isPlaying=\(isPlaying) visible=\(visibility) displaying=\(window != nil)")
         // Main thread: state machine + delegate.
         if let _ = source {
             stateMachine.play()
@@ -546,6 +574,7 @@ public final class TGSPlayerView: UIView {
     }
 
     public func pause() {
+        TGSDebugLog("player-pause id=\(debugID) isPlaying=\(isPlaying) visible=\(visibility) displaying=\(window != nil)")
         stateMachine.pause()
         delegate?.tgsPlayerViewDidPause(self)
         // Stop receiving vsync ticks. Any in-flight render task on the workQueue still
@@ -557,6 +586,7 @@ public final class TGSPlayerView: UIView {
     }
 
     public func stop() {
+        TGSDebugLog("player-stop id=\(debugID) isPlaying=\(isPlaying) visible=\(visibility) displaying=\(window != nil)")
         stateMachine.stop()
         isPlaying = false
         TGSPlaybackCoordinator.shared.unregister(self)
@@ -647,9 +677,13 @@ public final class TGSPlayerView: UIView {
         guard let frameSource else {
             // `setup` still loading; when `frameSource` is ready the setup closure will call
             // `play()` again and this path will run with a live source.
+            TGSDebugLog("player-start-waiting-source id=\(debugID) firstFrame=\(firstFrame)")
             return
         }
-        guard frameQueue != nil else { return }
+        guard frameQueue != nil else {
+            TGSDebugLog("player-start-missing-frame-queue id=\(debugID)")
+            return
+        }
         if let fromIndex {
             frameSource.skipToFrameIndex(fromIndex)
         }
@@ -675,6 +709,7 @@ public final class TGSPlayerView: UIView {
                 self,
                 frameRate: frameRate
             )
+            TGSDebugLog("player-coordinator-registered id=\(self.debugID) fps=\(frameRate)")
         }
     }
 
@@ -917,6 +952,7 @@ public final class TGSPlayerView: UIView {
         guard isPlaying != nextIsPlaying else {
             return
         }
+        TGSDebugLog("player-visibility-change id=\(debugID) next=\(nextIsPlaying) visible=\(visibilityGate.visibility) displaying=\(visibilityGate.isDisplaying) override=\(visibilityGate.overrideVisibility) autoplay=\(visibilityGate.autoplay)")
         isPlaying = nextIsPlaying
         if nextIsPlaying {
             play()

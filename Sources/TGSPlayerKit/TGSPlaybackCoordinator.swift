@@ -95,6 +95,9 @@ internal final class TGSPlaybackCoordinator {
 
     private var entries: [ObjectIdentifier: ViewEntry] = [:]
     private var displayLink: CADisplayLink?
+    private var lastDebugTimestamp: CFTimeInterval = 0
+    private var allInFlightSince: CFTimeInterval?
+    private var lastStallLogTimestamp: CFTimeInterval = 0
 
     private init() {}
 
@@ -114,19 +117,26 @@ internal final class TGSPlaybackCoordinator {
             entry.nextFireTimestamp = 0
             entry.inFlight = false
             ensureDisplayLinkRunning()
+            TGSDebugLog("coordinator-reregister id=\(id) fps=\(frameRate) entries=\(entries.count)")
             return entry
         }
         let entry = ViewEntry(view: view, frameInterval: interval)
         entries[id] = entry
         ensureDisplayLinkRunning()
+        TGSDebugLog("coordinator-register id=\(id) fps=\(frameRate) entries=\(entries.count)")
         return entry
     }
 
     func unregister(_ view: TGSPlayerView) {
         dispatchPrecondition(condition: .onQueue(.main))
-        entries.removeValue(forKey: ObjectIdentifier(view))
+        let id = ObjectIdentifier(view)
+        let removed = entries.removeValue(forKey: id) != nil
+        if removed {
+            TGSDebugLog("coordinator-unregister id=\(id) entries=\(entries.count)")
+        }
         if entries.isEmpty {
             displayLink?.isPaused = true
+            allInFlightSince = nil
         }
     }
 
@@ -203,6 +213,30 @@ internal final class TGSPlaybackCoordinator {
 
         if entries.isEmpty {
             link.isPaused = true
+        }
+        logDebugStatsIfNeeded(now: now)
+    }
+
+    private func logDebugStatsIfNeeded(now: CFTimeInterval) {
+        let entryCount = entries.count
+        let inFlightCount = entries.values.reduce(0) { $0 + ($1.inFlight ? 1 : 0) }
+        if entryCount > 0, inFlightCount == entryCount {
+            if allInFlightSince == nil {
+                allInFlightSince = now
+            }
+            if let since = allInFlightSince,
+               now - since >= 0.5,
+               now - lastStallLogTimestamp >= 0.5 {
+                lastStallLogTimestamp = now
+                TGSDebugLog("coordinator-all-inflight entries=\(entryCount) durationMs=\(Int((now - since) * 1000))")
+            }
+        } else {
+            allInFlightSince = nil
+        }
+
+        if now - lastDebugTimestamp >= 1 {
+            lastDebugTimestamp = now
+            TGSDebugLog("coordinator-stats entries=\(entryCount) inFlight=\(inFlightCount) paused=\(displayLink?.isPaused ?? true)")
         }
     }
 }

@@ -4,6 +4,11 @@ import UIKit
 
 public final class TGSStickerShimmerEffectView: UIView {
     private static let shimmerAnimationKey = "tgs.shimmer.translation"
+    private static let shimmerLocations: [NSNumber] = [
+        NSNumber(value: 1.0 / 3.0),
+        NSNumber(value: 0.5),
+        NSNumber(value: 2.0 / 3.0)
+    ]
 
     public private(set) var silhouette: TGSStickerSilhouette? {
         didSet { rebuildSilhouette() }
@@ -47,7 +52,7 @@ public final class TGSStickerShimmerEffectView: UIView {
 
         shimmerLayer.startPoint = CGPoint(x: 0, y: 0.5)
         shimmerLayer.endPoint = CGPoint(x: 1, y: 0.5)
-        shimmerLayer.locations = [0.0, 0.5, 1.0]
+        shimmerLayer.locations = Self.shimmerLocations
 
         backgroundLayer.fillColor = style.foregroundColor.cgColor
         updateGradientColors()
@@ -175,7 +180,7 @@ public final class TGSStickerShimmerEffectView: UIView {
         animation.duration = max(0.1, style.duration)
         animation.repeatCount = .infinity
         animation.isRemovedOnCompletion = false
-        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
         shimmerLayer.removeAnimation(forKey: Self.shimmerAnimationKey)
         shimmerLayer.add(animation, forKey: Self.shimmerAnimationKey)
     }

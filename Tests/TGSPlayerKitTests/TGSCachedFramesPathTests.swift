@@ -49,7 +49,7 @@ final class TGSCachedFramesPathTests: XCTestCase {
         let baseDir = URL(fileURLWithPath: "/tmp/tgsc-test", isDirectory: true)
         let dest = TGSCachedFramesPath.destination(
             baseDirectory: baseDir,
-            cacheKey: "/Users/whoever/Library/Caches/贴纸/wave.tgs",
+            cacheKey: "/Users/whoever/Library/Caches/stickers/café.tgs",
             width: 96,
             height: 96
         )

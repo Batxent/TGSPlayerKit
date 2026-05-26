@@ -182,6 +182,41 @@ final class TGSCachedFrameGeneratorTests: XCTestCase {
         wait(for: [exp1, cancelledExp], timeout: 1.0)
     }
 
+    func testCancellingAllHandlersBeforeWorkerStartsDropsQueuedGeneration() {
+        let queue = DispatchQueue(label: "cancel-all-test", qos: .utility)
+        let generator = TGSCachedFrameGenerator(workQueue: queue)
+        let cachePath = tempDir.appendingPathComponent("cancel-all.tgsc").path
+        let loader = CountingLoader(width: 8, height: 8, frameCount: 1, frameRate: 30)
+        let cbQueue = DispatchQueue(label: "cancel-all-cb")
+        let cancelledExp = expectation(description: "cancelled completion")
+        cancelledExp.isInverted = true
+
+        let releaseWorker = DispatchSemaphore(value: 0)
+        let workerEntered = DispatchSemaphore(value: 0)
+        queue.async {
+            workerEntered.signal()
+            releaseWorker.wait()
+        }
+        workerEntered.wait()
+
+        let token = generator.generate(
+            tgsData: gzippedEmptyJSON,
+            cachePath: cachePath,
+            cacheKey: "cancel-all-\(UUID().uuidString)",
+            width: 8,
+            height: 8,
+            loader: loader,
+            completionQueue: cbQueue
+        ) { _ in cancelledExp.fulfill() }
+
+        token.cancel()
+        releaseWorker.signal()
+
+        wait(for: [cancelledExp], timeout: 0.2)
+        XCTAssertEqual(loader.loadCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cachePath))
+    }
+
     // MARK: - Helpers
 
     /// Two-byte gzipped `{}` payload — same fixture the direct-source tests use.

@@ -1,58 +1,58 @@
-# TGSPlayerKit 性能优化路线图
+# TGSPlayerKit Performance Roadmap
 
-这份文档记录 TGSPlayerKit 在**已完成主体优化之后**仍可继续推进的性能改进项。
-每一项标注了**收益预估**、**工作量**、**风险**与**前置条件**，按"投入产出比"排序。
+This document tracks further performance work for TGSPlayerKit **after the main optimizations are in place**.
+Each item notes **expected benefit**, **effort**, **risk**, and **prerequisites**, ordered by return on effort.
 
 ---
 
-## 已完成（背景）
+## Done (context)
 
-| 类别 | 工作 |
+| Area | Work |
 |---|---|
-| **并发** | 单串行队列 → 每 view 串行 + 全局并发 `renderPool` |
-| **时钟** | per-view `DispatchSourceTimer` → 全局 `TGSPlaybackCoordinator` + `CADisplayLink`，单 `CATransaction` 批量提交 |
-| **内存** | `Data(count:)` 零填充 → 直接分配的 raw buffer + `Data(bytesNoCopy:)` |
-| **图层** | silhouette / imageView 懒创建（长列表大量 cell 不必要的图层树成本归零） |
-| **race-safety** | 锁保护的 generation token，cell 复用时丢弃过期工作 |
-| **decode** | gzip 解码预 reserve capacity 减少 reallocation |
-| **缓存（重头）** | XOR-delta + LZFSE 的 `.tgsc` 格式 + reader/writer + 后台 generator + `.cached` 模式端到端 wiring |
+| **Concurrency** | Single serial queue → per-view serial + global concurrent `renderPool` |
+| **Clocking** | Per-view `DispatchSourceTimer` → global `TGSPlaybackCoordinator` + `CADisplayLink`, batched commits in one `CATransaction` |
+| **Memory** | `Data(count:)` zero-fill → raw buffer + `Data(bytesNoCopy:)` |
+| **Layers** | Lazy silhouette / imageView (long lists: avoid unnecessary layer-tree cost in many cells) |
+| **Race safety** | Lock-protected generation token; stale work dropped on cell reuse |
+| **Decode** | gzip decode pre-reserves capacity to cut reallocations |
+| **Caching (major)** | XOR-delta + LZFSE `.tgsc` format + reader/writer + background generator + end-to-end `.cached` wiring |
 
-**当前热路径单帧成本对照：**
+**Current hot-path per-frame cost:**
 
-| 路径 | 单帧成本 | 是否触发 rlottie |
+| Path | Per-frame cost | rlottie invoked? |
 |---|---|---|
-| `.direct` | ~2-5ms（rlottie renderSync） | 是 |
-| `.cached`（命中） | **~50µs**（mmap + LZFSE + XOR） | 否 |
-| `.cached`（首次） | 同 `.direct`，但后台异步写缓存 | 是（一次性） |
+| `.direct` | ~2–5 ms (rlottie `renderSync`) | Yes |
+| `.cached` (hit) | **~50 µs** (mmap + LZFSE + XOR) | No |
+| `.cached` (first play) | Same as `.direct`, cache written async in background | Yes (one-time) |
 
 ---
 
-## P0：高收益、路径清晰
+## P0: High payoff, clear path
 
-### 1. CVPixelBuffer Pool + IOSurface 直挂 `layer.contents`
+### 1. CVPixelBuffer pool + IOSurface directly on `layer.contents`
 
-**现状**：每帧 `Data` → `CGImage(provider:...)` → `layer.contents = cgImage`。Core Animation 把 CGImage 的像素**复制到 IOSurface**给 render server 上屏。
+**Today:** Each frame `Data` → `CGImage(provider:...)` → `layer.contents = cgImage`. Core Animation **copies** CGImage pixels **into an IOSurface** for the render server.
 
-**改进**：rlottie / cached source 直接渲染进 IOSurface-backed `CVPixelBuffer`，`layer.contents = pixelBuffer`（或 `.takeRetainedValue()` 的 `IOSurface`）。零拷贝送到 GPU。配合 `CVPixelBufferPool` 跨帧复用 buffer，避免 malloc/free 抖动。
+**Change:** Render rlottie / cached sources straight into IOSurface-backed `CVPixelBuffer`, set `layer.contents = pixelBuffer` (or retained `IOSurface`). Zero-copy path to the GPU. Pair with `CVPixelBufferPool` to reuse buffers across frames and avoid malloc/free churn.
 
-- **收益**：96×96 节省约 36KB/帧 的拷贝（~3µs），192×192 约 12µs。看起来不多，但 30 个视图 × 60fps = **5400 次/秒**，累计 CPU 节省可观。**真正大头是 GPU**：少一次 IOSurface 上传等于少一次 render server 的内存带宽消耗。
-- **工作量**：中等（2-3 天）。需要：
-  1. 在 `TGSAnimatedStickerCachedFrameSource` / `TGSAnimatedStickerDirectFrameSource` 之外加一个并行 API 走 `CVPixelBuffer`
-  2. 一个 `TGSPixelBufferPool`（包 `CVPixelBufferPool` + LRU 退化为简单 fixed-size pool）
-  3. `TGSPlayerView` 配置开关 `usesPixelBufferPool: Bool`
-- **风险**：
-  - rlottie 当前 API 把像素写进调用方传入的 buffer，需要确认它能写进 IOSurface-backed buffer 的 baseAddress（应该可以，IOSurface 给出连续 RGBA 内存）。
-  - `CVPixelBufferPool` 的 buffer 数量需要调优——太少导致 frame queue 等 buffer，太多浪费内存。
-  - 不同 `(width, height)` 不能共享 pool，长列表里出现混合尺寸时 pool 数量膨胀。
-- **前置**：无。
+- **Benefit:** At 96×96 save ~36 KB/frame copy (~3 µs); at 192×192 ~12 µs. Small per frame, but 30 views × 60 fps = **5400 ops/s**, meaningful CPU savings. **The bigger win is GPU:** one fewer IOSurface upload means less memory bandwidth on the render server.
+- **Effort:** Medium (2–3 days). Needs:
+  1. A parallel API on top of `TGSAnimatedStickerCachedFrameSource` / `TGSAnimatedStickerDirectFrameSource` using `CVPixelBuffer`
+  2. `TGSPixelBufferPool` (wrap `CVPixelBufferPool` + simple fixed-size pool instead of heavy LRU)
+  3. `TGSPlayerView` flag `usesPixelBufferPool: Bool`
+- **Risk:**
+  - rlottie writes into caller-provided buffers; confirm IOSurface-backed `baseAddress` works (likely yes—contiguous RGBA).
+  - Pool size tuning—too few buffers stall the frame queue; too many waste memory.
+  - Mixed `(width, height)` cannot share one pool; long lists with mixed sizes multiply pools.
+- **Prerequisites:** None.
 
 ---
 
-### 2. 预生成 API（`prewarmCache`）
+### 2. Pregeneration API (`prewarmCache`)
 
-**现状**：第一次播缓存缺失时 fallback 到 direct，后台异步写 cache。但**第一次播**仍然慢。如果用户的使用场景是"我刚下载了 100 个贴纸，希望进表情面板就是 60fps"，那这条路径还不够。
+**Today:** On first play with a cache miss we fall back to direct and write cache in the background, but **first play** is still slow. If the scenario is “I just downloaded 100 stickers and want 60 fps in the panel,” this is not enough.
 
-**改进**：公开一个 API：
+**Change:** Public API:
 
 ```swift
 public extension TGSPlayerKit {
@@ -66,20 +66,20 @@ public extension TGSPlayerKit {
 }
 ```
 
-底层直接调 `TGSCachedFrameGenerator.shared.generate(...)`。App 在贴纸包下载完成时、或表情面板出现前 100ms 预热，第一次播就是 ~50µs/帧。
+Calls `TGSCachedFrameGenerator.shared.generate(...)` underneath. App warms after pack download or ~100 ms before the panel appears; first play becomes ~50 µs/frame.
 
-- **收益**：消除"第一次播慢"的体感问题。对 UX 影响大于纯性能数字。
-- **工作量**：**低**（半天）。基础设施都在了，就是一个公开 API + 文档。
-- **风险**：调用方滥用导致同时生成几百个 cache → CPU 烫手。**需要在 `TGSCachedFrameGenerator` 里加 max in-flight 限制**（目前是 serial queue，已经天然限流，但批量预热可能要一个"低优先级 + 可暂停"队列）。
-- **前置**：无。
+- **Benefit:** Removes “first play feels slow.” UX impact beats raw numbers.
+- **Effort:** **Low** (half day). Infra exists; it is a public API + docs.
+- **Risk:** Abuse (hundreds of concurrent generations) heats CPU. **Add max in-flight in `TGSCachedFrameGenerator`** (serial queue already throttles; bulk prewarm may need a low-priority, pausable queue).
+- **Prerequisites:** None.
 
 ---
 
-### 3. OSSignpost 仪器化
+### 3. OSSignpost instrumentation
 
-**现状**：性能问题靠猜。
+**Today:** Performance work is guesswork.
 
-**改进**：在关键路径插 `os_signpost`：
+**Change:** Add `os_signpost` on critical paths:
 
 ```swift
 let signposter = OSSignposter(subsystem: "com.tgsplayerkit", category: "render")
@@ -87,69 +87,69 @@ let state = signposter.beginInterval("rlottie-render", id: id)
 defer { signposter.endInterval("rlottie-render", state) }
 ```
 
-埋点处：
-- `rlottie::Animation::renderSync` 调用
+Places to instrument:
+- `rlottie::Animation::renderSync`
 - LZFSE decompress + XOR loop
 - `TGSCachedFrameGenerator.runGeneration`
-- 每 vsync `applyAllPendingCommits`（coordinator）
-- 帧提交到 layer.contents
+- Each vsync `applyAllPendingCommits` (coordinator)
+- Frame commit to `layer.contents`
 
-- **收益**：**不直接提速，但让后续每个优化决策有数据支撑**。Instruments 的 Points of Interest track 立刻可视化整条管线，瓶颈在哪一眼看清。
-- **工作量**：**低**（半天）。
-- **风险**：无。`os_signpost` 在没有捕获时是 nop。
-- **前置**：无。
+- **Benefit:** **Does not speed up code directly, but backs every later decision with data.** Instruments Points of Interest shows the full pipeline at a glance.
+- **Effort:** **Low** (half day).
+- **Risk:** None—`os_signpost` is a no-op when not recording.
+- **Prerequisites:** None.
 
 ---
 
-## P1：中等收益或更大工作量
+## P1: Medium payoff or larger effort
 
-### 4. FrameQueue length=2 双缓冲（隐藏 LZFSE 解码延迟）
+### 4. FrameQueue length=2 double buffering (hide LZFSE decode latency)
 
-**现状**：`TGSAnimatedStickerFrameQueue(length: 1, source: ...)`。每个 vsync 工作：拿当前帧 → 同步解码下一帧（这是 `generateFramesIfNeeded` 但 length=1 时其实不预取）。
-代码里已经留了注释：
+**Today:** `TGSAnimatedStickerFrameQueue(length: 1, source: ...)`. Each vsync: take current frame → synchronously decode next (`generateFramesIfNeeded`; with length 1 there is effectively no prefetch).
+Existing comment:
 > `// With queue length 1 there is no next-frame prefetch; keep the call for when length grows.`
 
-**改进**：把 length 改成 2，每次 take 后立即在 workQueue 上**预解码下一帧**。这样下一个 vsync 来时帧已经准备好，只剩 `layer.contents = ...`。
+**Change:** Set length to 2; after each take, **prefetch the next frame** on the work queue so the next vsync only assigns `layer.contents`.
 
-- **收益**：cached 模式下边际收益小（~50µs 已经很快），**direct 模式下显著**——能把 2-5ms 的 rlottie render 完全藏在前一帧的展示期间。对 `.direct` 长列表能改善 30%+ 的 worst-case 帧时间。
-- **工作量**：中（1-2 天）。Coordinator 已经按 vsync 驱动，需要让"render"和"present"两阶段错开一帧。会改 `TGSPlaybackCoordinator.ViewEntry` 的 pending commit 模型。
-- **风险**：
-  - 帧延迟+1（用户看到的帧落后 vsync 一拍）。对 60fps 是 16.7ms 延迟，对 30fps sticker 是 33ms。可感知但很轻微。
-  - First-frame eager 路径要避免双缓冲带来的多渲染一帧。
-- **前置**：建议先做 P0.3（os_signpost）量化收益。
-
----
-
-### 5. 磁盘缓存 LRU 清理
-
-**现状**：缓存写进 `~/Library/Caches/TGSPlayerKit/cached-frames/` 后**永不清理**。iOS 会在存储压力下整目录 purge，但不可预测。
-
-**改进**：`TGSCachedFrameDirectoryManager`：
-- 启动时（或第一次访问 directory 时）扫描目录总大小
-- 配置预算（默认 100MB）
-- 超预算时按 `mtime`（或更精确的 `atime`）LRU 删除直到回到 80% 预算
-- 删除过程在 background utility queue，不阻塞主线程
-
-可选：`TGSPlayerConfiguration.cacheBudgetBytes: Int?`。
-
-- **收益**：长期使用稳定性。不删的话用户存储被吃掉，iOS 突然 purge 会一次性删光，用户体验雪崩。
-- **工作量**：中（1-2 天，加测试）。
-- **风险**：扫描整个目录在贴纸量大（>1000）时 IO 成本。可缓存 manifest 文件记录 `(filename, size, lastAccess)`。
-- **前置**：无。
+- **Benefit:** Small marginal gain for cached (~50 µs already fast); **large for direct**—hide 2–5 ms rlottie inside the previous frame’s display window. Can improve worst-case frame time 30%+ for `.direct` long lists.
+- **Effort:** Medium (1–2 days). Coordinator is vsync-driven; render vs present must slip by one frame; updates `TGSPlaybackCoordinator.ViewEntry` pending-commit model.
+- **Risk:**
+  - +1 frame latency (one tick behind vsync). ~16.7 ms at 60 fps, ~33 ms at 30 fps sticker—slight but noticeable.
+  - First-frame eager path must avoid an extra render from double buffering.
+- **Prerequisites:** Prefer P0.3 (os_signpost) first to quantify.
 
 ---
 
-### 6. 性能度量 API
+### 5. On-disk cache LRU eviction
 
-**现状**：调用方不知道自己的 player 是否健康。
+**Today:** Caches under `~/Library/Caches/TGSPlayerKit/cached-frames/` **never** shrink. iOS may purge the whole directory under pressure—unpredictable.
 
-**改进**：
+**Change:** `TGSCachedFrameDirectoryManager`:
+- On launch (or first directory access) scan total size
+- Configurable budget (default 100 MB)
+- When over budget, LRU by `mtime` (or finer `atime`) until back to 80% of budget
+- Deletes on a background utility queue, not main thread
+
+Optional: `TGSPlayerConfiguration.cacheBudgetBytes: Int?`.
+
+- **Benefit:** Long-term stability; without eviction users lose disk space; sudden iOS purge is a bad UX cliff.
+- **Effort:** Medium (1–2 days + tests).
+- **Risk:** Full-directory scan I/O when sticker count is huge (>1000). Optional manifest `(filename, size, lastAccess)`.
+- **Prerequisites:** None.
+
+---
+
+### 6. Performance metrics API
+
+**Today:** Integrators cannot tell if a player is healthy.
+
+**Change:**
 ```swift
 public struct TGSPerformanceMetrics {
-    public let cacheHitRate: Double            // .cached 模式命中率
-    public let avgDecodeTimeMs: Double         // 最近 N 帧
-    public let droppedFrames: Int              // 累计跳过的帧数
-    public let timeToFirstFrameMs: Double      // setup → 首帧上屏
+    public let cacheHitRate: Double            // `.cached` hit rate
+    public let avgDecodeTimeMs: Double         // last N frames
+    public let droppedFrames: Int              // cumulative skipped frames
+    public let timeToFirstFrameMs: Double      // setup → first frame on screen
 }
 
 extension TGSPlayerView {
@@ -157,20 +157,20 @@ extension TGSPlayerView {
 }
 ```
 
-可以全局也可以 per-view。Per-view 更有用：能定位"哪个贴纸在拖后腿"。
+Global or per-view; per-view helps find “which sticker is slow.”
 
-- **收益**：本身不提速，但帮助使用方和我们诊断真实场景问题。
-- **工作量**：低-中（1 天）。
-- **风险**：度量本身有成本，要确保关闭 metrics 时是 nop。
-- **前置**：建议跟 P0.3 (os_signpost) 一起做。
+- **Benefit:** Does not speed up code, but helps integrators and us diagnose real scenarios.
+- **Effort:** Low–medium (1 day).
+- **Risk:** Metrics have cost; ensure disabled path is a no-op.
+- **Prerequisites:** Best paired with P0.3 (os_signpost).
 
 ---
 
-### 7. ProMotion 自适应帧率 CADisplayLink
+### 7. ProMotion-aware `CADisplayLink` frame rate
 
-**现状**：`CADisplayLink` 默认按 native vsync（120Hz on ProMotion）触发。对 30fps 的 sticker 我们每两 vsync 才出一新帧，靠 `missedTicks` 跳帧逻辑处理。
+**Today:** `CADisplayLink` fires at native vsync (120 Hz on ProMotion). For 30 fps stickers we emit a new frame every other vsync via `missedTicks` skipping.
 
-**改进**：根据当前正在播放的 sticker 的真实 fps 设置 `preferredFrameRateRange`：
+**Change:** Set `preferredFrameRateRange` from the sticker’s real fps:
 
 ```swift
 displayLink.preferredFrameRateRange = CAFrameRateRange(
@@ -180,191 +180,195 @@ displayLink.preferredFrameRateRange = CAFrameRateRange(
 )
 ```
 
-当不同 fps 的 sticker 同屏时取 max（最高 fps 的那个驱动节奏，其余靠 skip 节流）。
+When multiple fps values are on screen, use max (highest fps drives; others skip).
 
-- **收益**：ProMotion 设备上少 50% 的 vsync callback CPU。在 iPhone 15 Pro 长列表里直接体现为电池更耐用。
-- **工作量**：低（半天）。
-- **风险**：API 在 iOS 15+ 才稳定（`CAFrameRateRange`）。需要 `if #available` 分支。
-- **前置**：无。
-
----
-
-### 8. `.tgs` 内容 hash 进 cacheKey
-
-**现状**：cacheKey 默认是文件 path。如果 path 上的文件**内容更新了**（贴纸 author 更新了动画），cache 还是旧的，永远不会刷新。
-
-**改进**：两种方案：
-
-**方案 A（保守）**：在 cache 文件 header 加 sourceHash（4-8 字节 .tgs 文件的 SHA256 前缀），reader 启动时比对，不匹配则视为无效，触发重写。
-
-**方案 B（激进）**：把 .tgs 文件的内容 hash 拼进 cacheKey，不同内容自然落在不同 cache 文件。
-
-A 简单但旧 cache 不会被清理（依赖 P1.5 LRU）；B 清爽但破坏"同 path 同 cache"的去重直觉。
-
-- **收益**：避免"用户看到的是旧动画"的诡异 bug。
-- **工作量**：低（A 半天，B 1 天）。
-- **风险**：B 方案要求 source 在 cachedDataPath 时知道文件内容 hash → 需要先读一次文件计算 hash → 抵消了 cachedDataPath 的同步性。建议 A。
-- **前置**：建议跟 P1.5 一起做。
+- **Benefit:** ~50% fewer vsync callbacks on ProMotion—better battery on e.g. iPhone 15 Pro long lists.
+- **Effort:** Low (half day).
+- **Risk:** `CAFrameRateRange` needs `if #available` (stable iOS 15+).
+- **Prerequisites:** None.
 
 ---
 
-### 9. 视觉回归测试 + 性能基准
+### 8. Put `.tgs` content hash into cacheKey
 
-**现状**：62 个单元测试覆盖功能正确性，但没有：
-- "渲染 fixture .tgs，对比 direct 和 cached 像素完全一致"
-- "rlottie 单帧渲染 us / cached 单帧解码 us / 长列表模拟 60s fps" 的基准
+**Today:** cacheKey defaults to file path. If **file contents change** at that path (author updates animation), cache stays stale forever.
 
-**改进**：
-- `Tests/TGSPlayerKitVisualTests/` 加一个真实 `.tgs` fixture（用 Telegram 公开贴纸或自己做一个），对比 direct 和 cached 走通端到端
-- `Tests/TGSPlayerKitBenchmarks/` 用 XCTPerformance 跑：
-  - 单帧 cached 解码
-  - 单帧 direct 渲染
-  - 50 个 view × 5 秒滚动（模拟列表）
+**Change:** Two options:
 
-测试用 `measure(metrics: [...])` 跟踪 CPU + 内存。CI 上对比基线，回归直接 fail。
+**Option A (conservative):** Add `sourceHash` (4–8 byte SHA256 prefix of `.tgs`) in cache header; reader invalidates and rewrites on mismatch.
 
-- **收益**：每个 PR 自动验证性能没退化。
-- **工作量**：中-高（2-3 天，包括 fixture 准备和 CI 集成）。
-- **风险**：性能基准在 CI runner 上不稳定（容器、热节流）。要用相对比例而不是绝对时间作为断言基准。
-- **前置**：无。
+**Option B (aggressive):** Append content hash to cacheKey so different contents get different cache files.
+
+A is simple but old caches linger until P1.5 LRU; B is clean but breaks “same path → same cache” intuition.
+
+- **Benefit:** Avoids “user still sees old animation” bugs.
+- **Effort:** Low (A: half day; B: 1 day).
+- **Risk:** B needs content hash when using `cachedDataPath` → extra read → hurts sync story. Prefer A.
+- **Prerequisites:** Best with P1.5.
 
 ---
 
-## P2：锦上添花 / 投机性
+### 9. Visual regression + performance baselines
+
+**Today:** 62 unit tests cover correctness, but not:
+- “Render fixture `.tgs`; direct vs cached pixels match exactly”
+- Benchmarks for “rlottie per-frame µs / cached decode µs / 60 s simulated list scroll fps”
+
+**Benchmark plan:** Three-tier plan reviewed and documented in
+[`docs/performance/benchmark-plan.md`](docs/performance/benchmark-plan.md):
+Tier A = TGSPlayerKit micro-benchmarks; Tier B = Hawa signposts; Tier C = deferred scripted scenarios.
+
+**Change:**
+- `Tests/TGSPlayerKitVisualTests/` with a real `.tgs` fixture (Telegram public pack or custom), end-to-end direct vs cached pixel compare
+- `Tests/TGSPlayerKitBenchmarks/` with XCTest performance:
+  - Single-frame cached decode
+  - Single-frame direct render
+  - 50 views × 5 s scroll (list simulation)
+
+Use `measure(metrics: [...])` for CPU + memory; CI compares baselines and fails on regression.
+
+- **Benefit:** Every PR catches performance regressions automatically.
+- **Effort:** Medium–high (2–3 days incl. fixtures + CI).
+- **Risk:** CI runners are noisy (containers, thermal). Gate on ratios, not absolute times.
+- **Prerequisites:** None.
+
+---
+
+## P2: Nice-to-have / speculative
 
 ### 10. Native Metal renderer
 
-**现状**：`TGSNativeRendering` protocol 存在，但 `TGSUnavailableNativeRenderer` 是个占位。
+**Today:** `TGSNativeRendering` exists; `TGSUnavailableNativeRenderer` is a stub.
 
-**改进**：实现一个 Metal-based renderer，把 Lottie scene graph 转 GPU 指令（路径 → triangulate → vertex/fragment shader），跳过 CPU 栅格化。
+**Change:** Metal renderer translating Lottie scene graph to GPU work (paths → triangulate → shaders), skipping CPU rasterization.
 
-- **收益**：对**高度动态、不可缓存**的 sticker（用户 live editing、变量驱动的 sticker）才有意义。对静态可缓存的 sticker，cached source 已经把 CPU 成本压到几乎为 0，Metal 不会更快。
-- **工作量**：**高**（数周）。Lottie 的渲染模型（嵌套 mask、shape modifier、trim path、gradient）映射到 GPU 不简单。
-- **风险**：实现复杂度极高，bug 多。可能跑不赢 rlottie + cached 组合。
-- **前置**：先确认有真实需求。**当前优先级低**。
-
----
-
-### 11. CALayer-only API（跳过 UIView）
-
-**现状**：`TGSPlayerView: UIView`。每个 cell 一个 UIView，带来 hit-test、autolayout、accessibility 等开销。
-
-**改进**：抽出 `TGSPlayerLayer: CALayer`，`TGSPlayerView` 只是个壳子持有 layer。需要纯渲染（不要交互、不要响应链）的用例直接用 layer。
-
-- **收益**：每个 cell 约几 KB 内存 + UIView 注册/注销时的少量 CPU。长列表里有意义。
-- **工作量**：中（2 天）。要重构现在的 UIView 上挂的 silhouette/imageView。
-- **风险**：API 表面翻倍，文档/测试也要翻倍。
-- **前置**：先用 Instruments 看看 UIView overhead 是否真的是 hotspot。
+- **Benefit:** Only for **highly dynamic, uncacheable** stickers (live editing, variable-driven). For static cacheable stickers, cached source already drives CPU near zero; Metal will not beat it.
+- **Effort:** **High** (weeks). Masks, modifiers, trim paths, gradients are hard on GPU.
+- **Risk:** Very complex, bug-prone; may still lose to rlottie + cached.
+- **Prerequisites:** Confirm real product need. **Low priority today.**
 
 ---
 
-### 12. 远程 source + 网络缓存
+### 11. CALayer-only API (skip `UIView`)
 
-**现状**：`TGSAnimatedStickerLocalFileSource` 只能本地文件。
+**Today:** `TGSPlayerView` is a `UIView` per cell—hit testing, Auto Layout, accessibility overhead.
 
-**改进**：`TGSAnimatedStickerRemoteSource`：
-- HTTP fetch `.tgs` → 写到 `~/Library/Caches/TGSPlayerKit/tgs-blobs/` → 之后等同 local
-- 304 Not Modified / ETag 支持
-- 下载失败的指数退避
+**Change:** Extract `TGSPlayerLayer: CALayer`; `TGSPlayerView` becomes a thin shell. Pure rendering (no interaction, no responder chain) uses the layer directly.
 
-- **收益**：开箱即用。
-- **工作量**：中-高（3-5 天）。HTTP 缓存语义、并发下载、disk LRU 都要处理。
-- **风险**：与具体业务的 CDN / auth 模型耦合。可能更适合**让调用方自己实现** TGSAnimatedStickerSource，我们只提供示例。
-- **前置**：业务真实需求驱动。
+- **Benefit:** A few KB per cell + small UIView registration CPU; matters in long lists.
+- **Effort:** Medium (~2 days); refactor silhouette/imageView on `UIView`.
+- **Risk:** API surface doubles; docs/tests double.
+- **Prerequisites:** Confirm UIView overhead is a hotspot in Instruments.
 
 ---
 
-### 13. 流式解码
+### 12. Remote source + HTTP cache
 
-**现状**：`.tgs` 文件下载完成后才开始解码 + 渲染。
+**Today:** `TGSAnimatedStickerLocalFileSource` is local files only.
 
-**改进**：流式 gzip → 流式 JSON parser → 边接收边解析 → 第一个 keyframe 到达就可以渲染。
+**Change:** `TGSAnimatedStickerRemoteSource`:
+- HTTP fetch `.tgs` → `~/Library/Caches/TGSPlayerKit/tgs-blobs/` → then same as local
+- 304 / ETag
+- Exponential backoff on failure
 
-- **收益**：网络慢时减少"等待白屏"时间。
-- **工作量**：**高**。需要替换 `JSONSerialization`、写一个 streaming JSON parser、改 rlottie 的接口（rlottie 假设输入是完整 JSON）。
-- **风险**：rlottie 不支持流式输入是硬限制。
-- **前置**：跟 #12 一起做才有意义。
+- **Benefit:** Batteries-included remote loading.
+- **Effort:** Medium–high (3–5 days): HTTP semantics, concurrent downloads, disk LRU.
+- **Risk:** Couples to CDN/auth per app; often better to **let integrators implement** `TGSAnimatedStickerSource` and ship an example.
+- **Prerequisites:** Driven by product need.
+
+---
+
+### 13. Streaming decode
+
+**Today:** Decode + render start only after `.tgs` download completes.
+
+**Change:** Streaming gzip → streaming JSON → parse while receiving → render at first keyframe.
+
+- **Benefit:** Less “white screen wait” on slow networks.
+- **Effort:** **High**: replace `JSONSerialization`, build streaming parser, change rlottie contract (expects full JSON).
+- **Risk:** rlottie cannot stream input—hard limit.
+- **Prerequisites:** Pair with #12 if pursued.
 
 ---
 
 ### 14. `madvise(WILLNEED)` prefetch
 
-**现状**：cache 文件 mmap'd，frame 数据按需 page-fault 拉入物理内存。
+**Today:** Cache file is mmap’d; frame bytes fault in on demand.
 
-**改进**：每次 takeFrame 后，对**下一帧的字节区间**调用 `madvise(WILLNEED)`，让内核预读那几个 page。
+**Change:** After each `takeFrame`, `madvise(WILLNEED)` on the **next frame’s byte range**.
 
-- **收益**：纯磁盘 IO 优化。SSD 已经很快，**iOS 上几乎看不出差别**（实际 cache 文件小于一个 page，大部分情况已经全在内存）。
-- **工作量**：低（半天）。
-- **风险**：iOS 对 `madvise` 的支持有限，可能是 nop。
-- **前置**：建议跳过，除非看到 cache 文件 page fault 是热点。
-
----
-
-### 15. 共享 rlottie LottieInstance / model cache
-
-**现状**：rlottie 内部的 `LOTModelCache` 默认开启，按文件路径/JSON 缓存解析后的 model。我们之前尝试过共享 `LottieInstance` 但回滚了（实例有可变渲染状态，跨 view 不安全）。
-
-**改进**：验证 rlottie LOTModelCache 在我们使用模式下是否命中（同 cacheKey 多次 load 是否只解析一次 JSON）。如果没命中，在 Swift 侧加一个轻 wrapper：缓存 `(cacheKey → parsed JSON Data)`，N 个 view load 同一 sticker 时省 N-1 次 gzip + JSON 解析。
-
-- **收益**：长列表初始化时间减少。N=30 个相同 sticker view 时，从 30 次 gzip+parse 降到 1 次。
-- **工作量**：低-中（1 天，含验证 rlottie 内部 cache）。
-- **风险**：rlottie 的 cache 行为版本相关，要验证版本。
-- **前置**：用 Instruments 看是否真的有重复 parse。
+- **Benefit:** Pure disk I/O tweak. SSDs are fast; **hard to see on iOS** (small cache files often fit in one page already).
+- **Effort:** Low (half day).
+- **Risk:** `madvise` may be a no-op on iOS.
+- **Prerequisites:** Skip unless page faults show up as a hotspot.
 
 ---
 
-## 测试与度量
+### 15. Shared rlottie `LottieInstance` / model cache
 
-### 16. 长跑稳定性测试
+**Today:** rlottie’s `LOTModelCache` is on by default (path/JSON keyed). We tried sharing `LottieInstance` and rolled back (mutable render state—not safe across views).
 
-- `XCUITest` 脚本：100 个 view 的列表，连续滚动 60 秒
-- 监控：fps（>55 阈值）、内存增长（应趋于稳定）、CPU thermal state、无 crash
-- CI 上 nightly run
+**Change:** Verify `LOTModelCache` hits for our usage (same cacheKey loads parse JSON once). If not, a thin Swift cache `(cacheKey → parsed JSON Data)` so N views for one sticker pay one gzip+parse.
 
-### 17. 端到端真实 `.tgs` fixture
-
-- 选 3-5 个代表性 `.tgs`（简单/复杂/超大）放进 `Tests/Fixtures/`
-- 跑 direct → cache → reload → compare pixel-perfect
+- **Benefit:** Faster list init; N=30 identical views drop from 30× parse to 1×.
+- **Effort:** Low–medium (1 day + rlottie verification).
+- **Risk:** Cache behavior varies by rlottie version.
+- **Prerequisites:** Instruments to confirm duplicate parse is real.
 
 ---
 
-## 文档
+## Testing and measurement
 
-### 18. 集成方性能指南
+### 16. Long-run stability test
 
-写一篇 `docs/integration-guide.md`：
-- "总是用 `.cached` 模式"
-- "贴纸下载完即调用 `prewarmCache`"
-- "配置 `cacheBudgetBytes`"
-- "调试 fps 用 `metrics.droppedFrames` 或 Instruments + os_signpost"
+- `XCUITest`: list of 100 views, scroll 60 s continuously
+- Watch: fps (>55 threshold), memory plateau, CPU thermal state, no crashes
+- Nightly on CI
 
-### 19. Telegram AnimatedStickerNode 迁移指南
+### 17. End-to-end real `.tgs` fixtures
 
-API 对照表 + 行为差异说明，便于现有 Telegram-iOS 用户切换。
-
----
-
-## 优先级建议
-
-如果只能再做 3 件事：
-
-1. **#3 OSSignpost** —— 不是真正的优化，但能让后续每个决定有数据支撑。**先做这个**。
-2. **#1 CVPixelBuffer + IOSurface** —— 当前管线唯一剩下的"每帧像素拷贝"路径。
-3. **#2 prewarmCache** —— 改变首次播体感，工作量极小。
-
-如果时间充裕，再做 #5（LRU 清理）和 #9（性能基准）—— 这两个是生产稳定性的基础。
-
-剩下的 P2 都属于"等遇到问题再做"的范畴。
+- Pick 3–5 representative `.tgs` (simple / complex / large) under `Tests/Fixtures/`
+- Run direct → cache → reload → pixel-perfect compare
 
 ---
 
-## 不建议做（投入产出比差）
+## Documentation
 
-- **重写 rlottie**：项目当前用 rlottie 的部分已经被 `.cached` 模式绕过了大部分热路径，重写 ROI 极低。
-- **Metal 全自研渲染**：见 #10。
-- **GPU 上做 LZFSE**：LZFSE 是 CPU 字节流算法，GPU 上效率反而差。
-- **缩小 cache 文件格式**：目前 LZFSE + XOR delta 已经接近"压缩极限"，再压只能换更慢的算法。
+### 18. Integrator performance guide
+
+Add `docs/integration-guide.md`:
+- “Prefer `.cached` mode”
+- “Call `prewarmCache` after sticker download”
+- “Configure `cacheBudgetBytes`”
+- “Debug fps with `metrics.droppedFrames` or Instruments + os_signpost”
+
+### 19. Telegram `AnimatedStickerNode` migration guide
+
+API mapping + behavior differences for Telegram-iOS adopters.
 
 ---
 
-*最后更新：2026-05-26（commit `97ca26b`，`.cached` 模式端到端 wiring 完成后）*
+## Priority guidance
+
+If only three more things ship:
+
+1. **#3 OSSignpost** — not a speedup, but data for every later call. **Do this first.**
+2. **#1 CVPixelBuffer + IOSurface** — last major “per-frame pixel copy” in the pipeline.
+3. **#2 prewarmCache** — fixes first-play feel for minimal effort.
+
+If time remains, add #5 (LRU eviction) and #9 (benchmarks)—production stability foundations.
+
+Remaining P2 is “when pain appears.”
+
+---
+
+## Not recommended (poor ROI)
+
+- **Rewrite rlottie:** `.cached` already bypasses most hot paths; rewrite ROI is tiny.
+- **Full custom Metal renderer:** see #10.
+- **LZFSE on GPU:** LZFSE is a CPU byte-stream codec; GPU would be worse.
+- **Shrink cache format further:** LZFSE + XOR delta is already near practical limits; more compression means slower codecs.
+
+---
+
+*Last updated: 2026-05-26 (commit `97ca26b`, after `.cached` end-to-end wiring landed)*

@@ -292,11 +292,11 @@ Silhouette input is abstracted by `TGSStickerSilhouetteShape`:
 Shimmer behavior aligned with Telegram iOS:
 
 - Horizontal direction: `startPoint = (0, 0.5)`, `endPoint = (1, 0.5)`,
-  `locations = [0, 0.5, 1]`.
+  `locations = [1/3, 0.5, 2/3]` so both loop endpoints are fully clear.
 - Colors: `[clear, shimmeringColor, clear]`, default
   `shimmeringColor = white alpha 0.55`.
 - Animation: `transform.translation.x` from `-width` to `width`, infinite repeat,
-  `easeInEaseOut`, default `duration = 1.3s`.
+  `linear`, default `duration = 1.3s`.
 - Attach animation only while view is in window; stop automatically when removed.
 - Mask uses aspect-fit to place viewBox at the center of view bounds, ensuring the
   shimmer is visible only inside silhouette region.

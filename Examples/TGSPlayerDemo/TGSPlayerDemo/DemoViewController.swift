@@ -6,15 +6,17 @@ final class DemoViewController: UIViewController {
     private let animationLoader = TGSRLottieAnimationLoader()
     private let titleLabel = UILabel()
     private let metricsLabel = UILabel()
-    private let messagesTitleLabel = UILabel()
     private let messageTableView = RoomMessageListView()
+    private let inputBarView = ChatInputBarView()
     private let giftPanelView = GiftPanelView()
+    private let giftPanelHeight: CGFloat = 318
 
     private var catalog: DemoGiftCatalog = .empty
     private var messages: [DemoMessage] = [
-        .system("公屏消息列表"),
-        .system("从底部礼物面板选择礼物，点击后会发送到这里。TGS 礼物会在消息里播放。")
+        .system("TGSPlayerKit Demo")
     ]
+    private var inputBarBottomConstraint: NSLayoutConstraint?
+    private var giftPanelVisible = false
     private var frameCallbackCount = 0
 
     override func viewDidLoad() {
@@ -24,6 +26,7 @@ final class DemoViewController: UIViewController {
         configureHeader()
         configureMessages()
         configureGiftPanel()
+        configureInputBar()
         updateMetrics()
     }
 
@@ -50,11 +53,6 @@ final class DemoViewController: UIViewController {
     }
 
     private func configureMessages() {
-        messagesTitleLabel.text = "消息列表"
-        messagesTitleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
-        messagesTitleLabel.textColor = UIColor(white: 1, alpha: 0.82)
-        messagesTitleLabel.translatesAutoresizingMaskIntoConstraints = false
-
         messageTableView.separatorStyle = .none
         messageTableView.dataSource = self
         messageTableView.estimatedRowHeight = 168
@@ -62,41 +60,157 @@ final class DemoViewController: UIViewController {
         messageTableView.register(MessageCell.self, forCellReuseIdentifier: MessageCell.reuseIdentifier)
         messageTableView.translatesAutoresizingMaskIntoConstraints = false
 
-        view.addSubview(messagesTitleLabel)
         view.addSubview(messageTableView)
         NSLayoutConstraint.activate([
-            messagesTitleLabel.topAnchor.constraint(equalTo: metricsLabel.bottomAnchor, constant: 12),
-            messagesTitleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            messagesTitleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-            messageTableView.topAnchor.constraint(equalTo: messagesTitleLabel.bottomAnchor, constant: 8),
+            messageTableView.topAnchor.constraint(equalTo: metricsLabel.bottomAnchor, constant: 12),
             messageTableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             messageTableView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         ])
     }
 
     private func configureGiftPanel() {
-        giftPanelView.configure(stickers: catalog.stickers)
-        giftPanelView.onSelectSticker = { [weak self] sticker in
-            self?.sendSticker(sticker)
+        giftPanelView.configure(stickers: catalog.stickers, loader: animationLoader)
+        giftPanelView.onSelectSticker = { [weak self] sticker, sourceFrame in
+            self?.sendSticker(sticker, from: sourceFrame)
         }
+        giftPanelView.isHidden = true
+        giftPanelView.alpha = 0
+        giftPanelView.transform = CGAffineTransform(translationX: 0, y: giftPanelHeight + 24)
         giftPanelView.translatesAutoresizingMaskIntoConstraints = false
 
         view.addSubview(giftPanelView)
         NSLayoutConstraint.activate([
-            giftPanelView.topAnchor.constraint(equalTo: messageTableView.bottomAnchor),
             giftPanelView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             giftPanelView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             giftPanelView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
-            giftPanelView.heightAnchor.constraint(equalToConstant: 318)
+            giftPanelView.heightAnchor.constraint(equalToConstant: giftPanelHeight)
         ])
     }
 
-    private func sendSticker(_ sticker: DemoSticker) {
-        messages.append(.gift(sticker))
-        let indexPath = IndexPath(row: messages.count - 1, section: 0)
-        messageTableView.insertRows(at: [indexPath], with: .automatic)
-        messageTableView.scrollToRow(at: indexPath, at: .bottom, animated: true)
-        updateMetrics()
+    private func configureInputBar() {
+        inputBarView.onTapStickerButton = { [weak self] in
+            self?.toggleGiftPanel()
+        }
+        inputBarView.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(inputBarView)
+
+        let bottomConstraint = inputBarView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor)
+        inputBarBottomConstraint = bottomConstraint
+        NSLayoutConstraint.activate([
+            messageTableView.bottomAnchor.constraint(equalTo: inputBarView.topAnchor),
+            inputBarView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            inputBarView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            bottomConstraint,
+            inputBarView.heightAnchor.constraint(equalToConstant: 58)
+        ])
+    }
+
+    private func toggleGiftPanel() {
+        setGiftPanelVisible(!giftPanelVisible, animated: true)
+    }
+
+    private func setGiftPanelVisible(_ visible: Bool, animated: Bool) {
+        guard visible != giftPanelVisible else { return }
+        giftPanelVisible = visible
+        inputBarView.setStickerPanelVisible(visible)
+        inputBarBottomConstraint?.constant = visible ? -giftPanelHeight : 0
+
+        if visible {
+            giftPanelView.isHidden = false
+        }
+
+        let animations = {
+            self.giftPanelView.alpha = visible ? 1 : 0
+            self.giftPanelView.transform = visible ? .identity : CGAffineTransform(translationX: 0, y: self.giftPanelHeight + 24)
+            self.view.layoutIfNeeded()
+        }
+        let completion: (Bool) -> Void = { _ in
+            if !visible {
+                self.giftPanelView.isHidden = true
+            }
+        }
+
+        if animated {
+            UIView.animate(
+                withDuration: visible ? 0.32 : 0.24,
+                delay: 0,
+                usingSpringWithDamping: visible ? 0.92 : 1,
+                initialSpringVelocity: 0,
+                options: [.beginFromCurrentState, .allowUserInteraction, .curveEaseOut],
+                animations: animations,
+                completion: completion
+            )
+        } else {
+            animations()
+            completion(true)
+        }
+    }
+
+    private func sendSticker(_ sticker: DemoSticker, from sourceFrame: CGRect) {
+        playSendDropAnimation(sticker: sticker, from: sourceFrame) { [weak self] in
+            guard let self else { return }
+            messages.append(.gift(sticker))
+            let indexPath = IndexPath(row: messages.count - 1, section: 0)
+            messageTableView.insertRows(at: [indexPath], with: .automatic)
+            messageTableView.scrollToRow(at: indexPath, at: .bottom, animated: true)
+            updateMetrics()
+        }
+    }
+
+    private func playSendDropAnimation(
+        sticker: DemoSticker,
+        from sourceFrame: CGRect,
+        completion: @escaping () -> Void
+    ) {
+        let size = min(max(sourceFrame.width, 72), 104)
+        let startFrame = CGRect(
+            x: sourceFrame.midX - size / 2,
+            y: sourceFrame.minY - 10,
+            width: size,
+            height: size
+        )
+        let targetY = min(messageTableView.frame.maxY - size - 12, view.bounds.height - size - 24)
+        let targetFrame = CGRect(
+            x: max(20, min(sourceFrame.midX - size / 2, view.bounds.width - size - 20)),
+            y: targetY,
+            width: size,
+            height: size
+        )
+
+        let fallingView = TGSPlayerView(animationLoader: animationLoader)
+        fallingView.frame = startFrame
+        fallingView.backgroundColor = UIColor.clear
+        fallingView.setup(
+            source: TGSAnimatedStickerLocalFileSource(path: sticker.playbackPath),
+            width: 128,
+            height: 128,
+            playbackMode: TGSAnimatedStickerPlaybackMode.loop,
+            mode: TGSAnimatedStickerMode.cached
+        )
+        fallingView.overrideVisibility = true
+        fallingView.visibility = true
+        fallingView.autoplay = true
+        view.addSubview(fallingView)
+
+        UIView.animateKeyframes(
+            withDuration: 0.62,
+            delay: 0,
+            options: [.calculationModeCubic, .allowUserInteraction]
+        ) {
+            UIView.addKeyframe(withRelativeStartTime: 0, relativeDuration: 0.22) {
+                fallingView.transform = CGAffineTransform(scaleX: 1.18, y: 1.18)
+                fallingView.center.y -= 26
+            }
+            UIView.addKeyframe(withRelativeStartTime: 0.18, relativeDuration: 0.62) {
+                fallingView.frame = targetFrame
+                fallingView.transform = CGAffineTransform(scaleX: 0.62, y: 0.62)
+                fallingView.alpha = 0.28
+            }
+        } completion: { _ in
+            fallingView.reset()
+            fallingView.removeFromSuperview()
+            completion()
+        }
     }
 
     private func updateMetrics() {
@@ -148,13 +262,20 @@ private struct DemoGiftCatalog {
     }
 
     static func loadFromBundle() -> DemoGiftCatalog {
-        let bundledURLs = Bundle.main.urls(forResourcesWithExtension: "tgs", subdirectory: "tgs")
-            ?? Bundle.main.urls(forResourcesWithExtension: "tgs", subdirectory: nil)
-            ?? []
+        let bundledURLs = loadBundledTGSURLs()
         let stickers = bundledURLs
             .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             .map(DemoSticker.init(fileURL:))
         return DemoGiftCatalog(stickers: stickers)
+    }
+
+    private static func loadBundledTGSURLs() -> [URL] {
+        let nestedURLs = Bundle.main.urls(forResourcesWithExtension: "tgs", subdirectory: "tgs") ?? []
+        let flatURLs = Bundle.main.urls(forResourcesWithExtension: "tgs", subdirectory: nil) ?? []
+        var seen = Set<String>()
+        return (nestedURLs + flatURLs).filter { url in
+            seen.insert(url.lastPathComponent).inserted
+        }
     }
 }
 
@@ -175,14 +296,86 @@ private struct DemoSticker {
     }
 }
 
+private final class ChatInputBarView: UIView {
+    var onTapStickerButton: (() -> Void)?
+
+    private let stickerButton = UIButton(type: .system)
+    private let inputBackgroundView = UIView()
+    private let placeholderLabel = UILabel()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = UIColor(red: 0.09, green: 0.10, blue: 0.12, alpha: 0.98)
+        configureSubviews()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func setStickerPanelVisible(_ visible: Bool) {
+        let imageName = visible ? "keyboard.chevron.compact.down" : "face.smiling"
+        stickerButton.setImage(UIImage(systemName: imageName), for: .normal)
+        stickerButton.tintColor = visible
+            ? UIColor(red: 0.29, green: 0.67, blue: 1.0, alpha: 1)
+            : UIColor(white: 1, alpha: 0.78)
+    }
+
+    private func configureSubviews() {
+        layer.shadowColor = UIColor.black.cgColor
+        layer.shadowOpacity = 0.2
+        layer.shadowRadius = 14
+        layer.shadowOffset = CGSize(width: 0, height: -5)
+
+        stickerButton.setImage(UIImage(systemName: "face.smiling"), for: .normal)
+        stickerButton.tintColor = UIColor(white: 1, alpha: 0.78)
+        stickerButton.addTarget(self, action: #selector(stickerButtonTapped), for: .touchUpInside)
+        stickerButton.addTarget(self, action: #selector(stickerButtonTapped), for: .primaryActionTriggered)
+        stickerButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stickerButton)
+
+        inputBackgroundView.backgroundColor = UIColor(white: 1, alpha: 0.08)
+        inputBackgroundView.layer.cornerRadius = 18
+        inputBackgroundView.layer.masksToBounds = true
+        inputBackgroundView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(inputBackgroundView)
+
+        placeholderLabel.text = "Message"
+        placeholderLabel.font = .systemFont(ofSize: 15, weight: .regular)
+        placeholderLabel.textColor = UIColor(white: 1, alpha: 0.42)
+        placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
+        inputBackgroundView.addSubview(placeholderLabel)
+
+        NSLayoutConstraint.activate([
+            stickerButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            stickerButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            stickerButton.widthAnchor.constraint(equalToConstant: 44),
+            stickerButton.heightAnchor.constraint(equalToConstant: 44),
+            inputBackgroundView.leadingAnchor.constraint(equalTo: stickerButton.trailingAnchor, constant: 4),
+            inputBackgroundView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            inputBackgroundView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            inputBackgroundView.heightAnchor.constraint(equalToConstant: 38),
+            placeholderLabel.leadingAnchor.constraint(equalTo: inputBackgroundView.leadingAnchor, constant: 14),
+            placeholderLabel.trailingAnchor.constraint(equalTo: inputBackgroundView.trailingAnchor, constant: -14),
+            placeholderLabel.centerYAnchor.constraint(equalTo: inputBackgroundView.centerYAnchor)
+        ])
+    }
+
+    @objc private func stickerButtonTapped() {
+        onTapStickerButton?()
+    }
+}
+
 private final class GiftPanelView: UIView {
-    var onSelectSticker: ((DemoSticker) -> Void)?
+    var onSelectSticker: ((DemoSticker, CGRect) -> Void)?
 
     private let titleLabel = UILabel()
     private let layout = UICollectionViewFlowLayout()
     private lazy var collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
 
     private var stickers: [DemoSticker] = []
+    private var loader: TGSLottieAnimationLoading?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -198,13 +391,14 @@ private final class GiftPanelView: UIView {
         nil
     }
 
-    func configure(stickers: [DemoSticker]) {
+    func configure(stickers: [DemoSticker], loader: TGSLottieAnimationLoading) {
         self.stickers = stickers
+        self.loader = loader
         collectionView.reloadData()
     }
 
     private func configureSubviews() {
-        titleLabel.text = "TGS 文件"
+        titleLabel.text = "TGS files"
         titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
         titleLabel.textColor = .white
 
@@ -244,12 +438,14 @@ extension GiftPanelView: UICollectionViewDataSource, UICollectionViewDelegateFlo
             withReuseIdentifier: GiftCell.reuseIdentifier,
             for: indexPath
         ) as! GiftCell
-        cell.configure(sticker: stickers[indexPath.item])
+        cell.configure(sticker: stickers[indexPath.item], loader: loader)
         return cell
     }
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
-        onSelectSticker?(stickers[indexPath.item])
+        guard let cell = collectionView.cellForItem(at: indexPath) else { return }
+        let sourceFrame = cell.convert(cell.bounds, to: nil)
+        onSelectSticker?(stickers[indexPath.item], sourceFrame)
     }
 
     func collectionView(
@@ -266,9 +462,10 @@ extension GiftPanelView: UICollectionViewDataSource, UICollectionViewDelegateFlo
 private final class GiftCell: UICollectionViewCell {
     static let reuseIdentifier = "GiftCell"
 
-    private let previewView = TGSStickerShimmerEffectView()
+    private let playerView = TGSPlayerView()
     private let nameLabel = UILabel()
     private let typeLabel = UILabel()
+    private var source: TGSAnimatedStickerLocalFileSource?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -276,8 +473,9 @@ private final class GiftCell: UICollectionViewCell {
         contentView.layer.cornerRadius = 8
         contentView.layer.masksToBounds = true
 
-        previewView.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(previewView)
+        playerView.backgroundColor = .clear
+        playerView.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(playerView)
 
         nameLabel.font = .systemFont(ofSize: 12, weight: .medium)
         nameLabel.textColor = UIColor(white: 1, alpha: 0.88)
@@ -293,13 +491,13 @@ private final class GiftCell: UICollectionViewCell {
         contentView.addSubview(typeLabel)
 
         NSLayoutConstraint.activate([
-            previewView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 8),
-            previewView.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
-            previewView.widthAnchor.constraint(equalToConstant: 52),
-            previewView.heightAnchor.constraint(equalToConstant: 52),
+            playerView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 8),
+            playerView.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+            playerView.widthAnchor.constraint(equalToConstant: 52),
+            playerView.heightAnchor.constraint(equalToConstant: 52),
             nameLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 4),
             nameLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -4),
-            nameLabel.topAnchor.constraint(equalTo: previewView.bottomAnchor, constant: 6),
+            nameLabel.topAnchor.constraint(equalTo: playerView.bottomAnchor, constant: 6),
             typeLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 4),
             typeLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -4),
             typeLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 2),
@@ -314,16 +512,31 @@ private final class GiftCell: UICollectionViewCell {
 
     override func prepareForReuse() {
         super.prepareForReuse()
-        previewView.stopAnimating()
-        previewView.setSilhouette(nil)
+        playerView.reset()
+        source = nil
     }
 
-    func configure(sticker: DemoSticker) {
+    func configure(sticker: DemoSticker, loader: TGSLottieAnimationLoading?) {
         nameLabel.text = sticker.stickerName
         typeLabel.text = "TGS"
         typeLabel.textColor = UIColor(red: 0.25, green: 0.70, blue: 1.0, alpha: 1)
-        previewView.setSilhouette(nil)
-        previewView.startAnimating()
+        guard let loader else {
+            playerView.reset()
+            return
+        }
+        playerView.animationLoader = loader
+        let source = TGSAnimatedStickerLocalFileSource(path: sticker.playbackPath)
+        self.source = source
+        playerView.setup(
+            source: source,
+            width: 96,
+            height: 96,
+            playbackMode: .loop,
+            mode: .cached
+        )
+        playerView.overrideVisibility = true
+        playerView.visibility = true
+        playerView.autoplay = true
     }
 }
 
@@ -369,8 +582,8 @@ private final class MessageCell: UITableViewCell {
             playerView.isHidden = true
             playerView.reset()
         case let .gift(sticker):
-            titleLabel.text = "发送 \(sticker.stickerName).tgs"
-            subtitleLabel.text = "本地 TGS 文件 #\(sticker.id)"
+            titleLabel.text = "Send \(sticker.stickerName).tgs"
+            subtitleLabel.text = "Local TGS file #\(sticker.id)"
             playerView.isHidden = false
             playerView.animationLoader = loader
             playerView.frameUpdated = { _, _ in onFrame() }
