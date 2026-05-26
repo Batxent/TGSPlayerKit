@@ -16,4 +16,4 @@ Then open:
 Examples/TGSPlayerDemo/TGSPlayerDemo.xcodeproj
 ```
 
-The demo links the local `TGSPlayerKit` package, the generated `TGSPlayerKitRLottieNative.xcframework`, and the Swift adapter source. It shows a grid stress test with live FPS and frame callback counters.
+The demo links the local `TGSPlayerKit` package, the generated `TGSPlayerKitRLottieNative.xcframework`, and the Swift adapter source. It shows a chat-like gift flow: a bottom collection-view gift panel lists the local `.tgs` files from `Resources/tgs`, and tapping a file sends it into the message list where `TGSPlayerView` plays it through `TGSAnimatedStickerLocalFileSource`.

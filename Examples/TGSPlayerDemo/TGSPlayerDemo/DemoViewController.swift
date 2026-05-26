@@ -1,256 +1,255 @@
-import Darwin
+import Foundation
 import TGSPlayerKit
 import UIKit
 
 final class DemoViewController: UIViewController {
-    private struct StressProfile {
-        let title: String
-        let itemCount: Int
-        let columns: Int
-    }
-
-    private let stressProfiles: [StressProfile] = [
-        StressProfile(title: "24", itemCount: 24, columns: 4),
-        StressProfile(title: "60", itemCount: 60, columns: 6),
-        StressProfile(title: "120", itemCount: 120, columns: 8)
-    ]
-
     private let animationLoader = TGSRLottieAnimationLoader()
-    private let metricsView = PerformanceMetricsView()
-    private let profileControl = UISegmentedControl(items: ["24", "60", "120"])
-    private let pauseButton = UIButton(type: .system)
-    private let silhouetteSwitch = UISwitch()
-    private let silhouetteLabel = UILabel()
-    private let layout = UICollectionViewFlowLayout()
-    private lazy var collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
+    private let titleLabel = UILabel()
+    private let metricsLabel = UILabel()
+    private let messagesTitleLabel = UILabel()
+    private let messageTableView = RoomMessageListView()
+    private let giftPanelView = GiftPanelView()
 
-    private var displayLink: CADisplayLink?
-    private var lastDisplayTimestamp: CFTimeInterval = 0
-    private var lastMetricsTimestamp: CFTimeInterval = 0
-    private var fpsSamples: [Double] = []
-    private var frameCallbackCount: Int = 0
-    private var selectedProfileIndex: Int = 1
-    private var isPaused: Bool = false
-    private var silhouetteEnabled: Bool = true
-
-    private let silhouetteSVG = """
-    <svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 512 512\">\
-    <path d=\"M 256 60 C 320 60 360 100 360 150 C 380 130 410 130 425 150 C 440 175 425 215 395 215 \
-    C 415 245 425 285 425 320 C 425 400 360 460 256 460 C 152 460 87 400 87 320 C 87 285 97 245 117 215 \
-    C 87 215 72 175 87 150 C 102 130 132 130 152 150 C 152 100 192 60 256 60 Z\"/>\
-    </svg>
-    """
-
-    private var samplePath: String {
-        guard let path = Bundle.main.path(forResource: "sample_pulse", ofType: "json") else {
-            preconditionFailure("Missing sample_pulse.json")
-        }
-        return path
-    }
+    private var catalog: DemoGiftCatalog = .empty
+    private var messages: [DemoMessage] = [
+        .system("公屏消息列表"),
+        .system("从底部礼物面板选择礼物，点击后会发送到这里。TGS 礼物会在消息里播放。")
+    ]
+    private var frameCallbackCount = 0
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = UIColor(red: 0.06, green: 0.07, blue: 0.08, alpha: 1.0)
-        configureControls()
-        configureCollectionView()
-        startMetricsDisplayLink()
+        catalog = DemoGiftCatalog.loadFromBundle()
+        configureHeader()
+        configureMessages()
+        configureGiftPanel()
+        updateMetrics()
     }
 
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        layout.itemSize = itemSize()
-        layout.invalidateLayout()
-    }
+    private func configureHeader() {
+        titleLabel.text = "TGSPlayerKit Gift Demo"
+        titleLabel.font = .systemFont(ofSize: 20, weight: .bold)
+        titleLabel.textColor = .white
 
-    deinit {
-        displayLink?.invalidate()
-    }
+        metricsLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        metricsLabel.textColor = UIColor(white: 1.0, alpha: 0.72)
+        metricsLabel.numberOfLines = 2
 
-    private func configureControls() {
-        profileControl.selectedSegmentIndex = selectedProfileIndex
-        profileControl.addTarget(self, action: #selector(profileChanged), for: .valueChanged)
+        let stack = UIStackView(arrangedSubviews: [titleLabel, metricsLabel])
+        stack.axis = .vertical
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
 
-        pauseButton.setTitle("Pause", for: .normal)
-        pauseButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
-        pauseButton.tintColor = .white
-        pauseButton.addTarget(self, action: #selector(togglePause), for: .touchUpInside)
-
-        silhouetteLabel.text = "Silhouette"
-        silhouetteLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        silhouetteLabel.textColor = UIColor(white: 1.0, alpha: 0.86)
-        silhouetteSwitch.isOn = silhouetteEnabled
-        silhouetteSwitch.onTintColor = UIColor.systemBlue
-        silhouetteSwitch.addTarget(self, action: #selector(silhouetteToggled), for: .valueChanged)
-
-        let silhouetteStack = UIStackView(arrangedSubviews: [silhouetteLabel, silhouetteSwitch])
-        silhouetteStack.axis = .horizontal
-        silhouetteStack.spacing = 6
-        silhouetteStack.alignment = .center
-
-        let controls = UIStackView(arrangedSubviews: [profileControl, silhouetteStack, pauseButton])
-        controls.axis = .horizontal
-        controls.spacing = 12
-        controls.alignment = .center
-        controls.distribution = .fill
-
-        profileControl.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        silhouetteStack.setContentHuggingPriority(.required, for: .horizontal)
-        pauseButton.setContentHuggingPriority(.required, for: .horizontal)
-
-        let header = UIStackView(arrangedSubviews: [metricsView, controls])
-        header.axis = .vertical
-        header.spacing = 12
-        header.translatesAutoresizingMaskIntoConstraints = false
-
-        view.addSubview(header)
+        view.addSubview(stack)
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
-            header.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
-            header.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
+            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16)
         ])
     }
 
-    private func configureCollectionView() {
-        layout.minimumLineSpacing = 8
-        layout.minimumInteritemSpacing = 8
-        layout.sectionInset = UIEdgeInsets(top: 12, left: 12, bottom: 24, right: 12)
+    private func configureMessages() {
+        messagesTitleLabel.text = "消息列表"
+        messagesTitleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        messagesTitleLabel.textColor = UIColor(white: 1, alpha: 0.82)
+        messagesTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        messageTableView.separatorStyle = .none
+        messageTableView.dataSource = self
+        messageTableView.estimatedRowHeight = 168
+        messageTableView.rowHeight = UITableView.automaticDimension
+        messageTableView.register(MessageCell.self, forCellReuseIdentifier: MessageCell.reuseIdentifier)
+        messageTableView.translatesAutoresizingMaskIntoConstraints = false
+
+        view.addSubview(messagesTitleLabel)
+        view.addSubview(messageTableView)
+        NSLayoutConstraint.activate([
+            messagesTitleLabel.topAnchor.constraint(equalTo: metricsLabel.bottomAnchor, constant: 12),
+            messagesTitleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            messagesTitleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            messageTableView.topAnchor.constraint(equalTo: messagesTitleLabel.bottomAnchor, constant: 8),
+            messageTableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            messageTableView.trailingAnchor.constraint(equalTo: view.trailingAnchor)
+        ])
+    }
+
+    private func configureGiftPanel() {
+        giftPanelView.configure(stickers: catalog.stickers)
+        giftPanelView.onSelectSticker = { [weak self] sticker in
+            self?.sendSticker(sticker)
+        }
+        giftPanelView.translatesAutoresizingMaskIntoConstraints = false
+
+        view.addSubview(giftPanelView)
+        NSLayoutConstraint.activate([
+            giftPanelView.topAnchor.constraint(equalTo: messageTableView.bottomAnchor),
+            giftPanelView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            giftPanelView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            giftPanelView.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            giftPanelView.heightAnchor.constraint(equalToConstant: 318)
+        ])
+    }
+
+    private func sendSticker(_ sticker: DemoSticker) {
+        messages.append(.gift(sticker))
+        let indexPath = IndexPath(row: messages.count - 1, section: 0)
+        messageTableView.insertRows(at: [indexPath], with: .automatic)
+        messageTableView.scrollToRow(at: indexPath, at: .bottom, animated: true)
+        updateMetrics()
+    }
+
+    private func updateMetrics() {
+        let giftCount = messages.filter {
+            if case .gift = $0 { return true }
+            return false
+        }.count
+        metricsLabel.text = "\(catalog.stickerCount) stickers · \(catalog.tgsStickerCount) playable TGS · \(giftCount) sent · \(frameCallbackCount) rendered frames"
+    }
+}
+
+extension DemoViewController: UITableViewDataSource {
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        messages.count
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let cell = tableView.dequeueReusableCell(
+            withIdentifier: MessageCell.reuseIdentifier,
+            for: indexPath
+        ) as! MessageCell
+        cell.configure(
+            message: messages[indexPath.row],
+            loader: animationLoader
+        ) { [weak self] in
+            self?.frameCallbackCount += 1
+            self?.updateMetrics()
+        }
+        return cell
+    }
+}
+
+private enum DemoMessage {
+    case system(String)
+    case gift(DemoSticker)
+}
+
+private struct DemoGiftCatalog {
+    let stickers: [DemoSticker]
+
+    static let empty = DemoGiftCatalog(stickers: [])
+
+    var stickerCount: Int {
+        stickers.count
+    }
+
+    var tgsStickerCount: Int {
+        stickers.count
+    }
+
+    static func loadFromBundle() -> DemoGiftCatalog {
+        let bundledURLs = Bundle.main.urls(forResourcesWithExtension: "tgs", subdirectory: "tgs")
+            ?? Bundle.main.urls(forResourcesWithExtension: "tgs", subdirectory: nil)
+            ?? []
+        let stickers = bundledURLs
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+            .map(DemoSticker.init(fileURL:))
+        return DemoGiftCatalog(stickers: stickers)
+    }
+}
+
+private struct DemoSticker {
+    let fileURL: URL
+    let id: Int
+    let stickerName: String
+
+    init(fileURL: URL) {
+        self.fileURL = fileURL
+        let name = fileURL.deletingPathExtension().lastPathComponent
+        id = Int(name) ?? 0
+        stickerName = name
+    }
+
+    var playbackPath: String {
+        fileURL.path
+    }
+}
+
+private final class GiftPanelView: UIView {
+    var onSelectSticker: ((DemoSticker) -> Void)?
+
+    private let titleLabel = UILabel()
+    private let layout = UICollectionViewFlowLayout()
+    private lazy var collectionView = UICollectionView(frame: .zero, collectionViewLayout: layout)
+
+    private var stickers: [DemoSticker] = []
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = UIColor(red: 0.10, green: 0.11, blue: 0.13, alpha: 1.0)
+        layer.cornerRadius = 18
+        layer.maskedCorners = [.layerMinXMinYCorner, .layerMaxXMinYCorner]
+        layer.masksToBounds = true
+        configureSubviews()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func configure(stickers: [DemoSticker]) {
+        self.stickers = stickers
+        collectionView.reloadData()
+    }
+
+    private func configureSubviews() {
+        titleLabel.text = "TGS 文件"
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        titleLabel.textColor = .white
+
+        layout.minimumLineSpacing = 12
+        layout.minimumInteritemSpacing = 10
+        layout.sectionInset = UIEdgeInsets(top: 12, left: 16, bottom: 18, right: 16)
 
         collectionView.backgroundColor = .clear
         collectionView.dataSource = self
         collectionView.delegate = self
-        collectionView.register(StickerCell.self, forCellWithReuseIdentifier: StickerCell.reuseIdentifier)
-        collectionView.translatesAutoresizingMaskIntoConstraints = false
         collectionView.alwaysBounceVertical = true
-        collectionView.showsVerticalScrollIndicator = false
+        collectionView.register(GiftCell.self, forCellWithReuseIdentifier: GiftCell.reuseIdentifier)
 
-        view.addSubview(collectionView)
+        let stack = UIStackView(arrangedSubviews: [titleLabel, collectionView])
+        stack.axis = .vertical
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+
         NSLayoutConstraint.activate([
-            collectionView.topAnchor.constraint(equalTo: profileControl.bottomAnchor, constant: 12),
-            collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            collectionView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 14),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
     }
 
-    private func startMetricsDisplayLink() {
-        let displayLink = CADisplayLink(target: self, selector: #selector(displayLinkDidTick(_:)))
-        displayLink.preferredFramesPerSecond = 60
-        displayLink.add(to: .main, forMode: .common)
-        self.displayLink = displayLink
-    }
-
-    private func itemSize() -> CGSize {
-        let profile = stressProfiles[selectedProfileIndex]
-        let horizontalInset = layout.sectionInset.left + layout.sectionInset.right
-        let spacing = CGFloat(profile.columns - 1) * layout.minimumInteritemSpacing
-        let availableWidth = max(1, collectionView.bounds.width - horizontalInset - spacing)
-        let width = floor(availableWidth / CGFloat(profile.columns))
-        return CGSize(width: max(40, width), height: max(40, width))
-    }
-
-    private func restartVisiblePlayers() {
-        for cell in collectionView.visibleCells {
-            (cell as? StickerCell)?.setPaused(isPaused)
-        }
-    }
-
-    @objc private func profileChanged() {
-        selectedProfileIndex = max(0, profileControl.selectedSegmentIndex)
-        frameCallbackCount = 0
-        fpsSamples.removeAll(keepingCapacity: true)
-        layout.itemSize = itemSize()
-        collectionView.reloadData()
-    }
-
-    @objc private func togglePause() {
-        isPaused.toggle()
-        pauseButton.setTitle(isPaused ? "Resume" : "Pause", for: .normal)
-        restartVisiblePlayers()
-    }
-
-    @objc private func silhouetteToggled() {
-        silhouetteEnabled = silhouetteSwitch.isOn
-        frameCallbackCount = 0
-        fpsSamples.removeAll(keepingCapacity: true)
-        collectionView.reloadData()
-    }
-
-    @objc private func displayLinkDidTick(_ link: CADisplayLink) {
-        if lastDisplayTimestamp > 0 {
-            let delta = link.timestamp - lastDisplayTimestamp
-            if delta > 0 {
-                fpsSamples.append(1.0 / delta)
-            }
-        }
-        lastDisplayTimestamp = link.timestamp
-
-        guard link.timestamp - lastMetricsTimestamp >= 1.0 else {
-            return
-        }
-
-        let averageFPS = fpsSamples.isEmpty ? 0 : fpsSamples.reduce(0, +) / Double(fpsSamples.count)
-        let profile = stressProfiles[selectedProfileIndex]
-        metricsView.update(
-            fps: averageFPS,
-            framesPerSecond: frameCallbackCount,
-            visiblePlayers: collectionView.visibleCells.count,
-            totalPlayers: profile.itemCount,
-            memoryMB: residentMemoryMB()
-        )
-        frameCallbackCount = 0
-        fpsSamples.removeAll(keepingCapacity: true)
-        lastMetricsTimestamp = link.timestamp
-    }
-
-    private func residentMemoryMB() -> Double {
-        var info = mach_task_basic_info()
-        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.stride / MemoryLayout<natural_t>.stride)
-        let result = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
-            }
-        }
-        guard result == KERN_SUCCESS else {
-            return 0
-        }
-        return Double(info.resident_size) / 1_048_576.0
-    }
 }
 
-extension DemoViewController: UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
+extension GiftPanelView: UICollectionViewDataSource, UICollectionViewDelegateFlowLayout {
     func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
-        stressProfiles[selectedProfileIndex].itemCount
+        return stickers.count
     }
 
-    func collectionView(
-        _ collectionView: UICollectionView,
-        cellForItemAt indexPath: IndexPath
-    ) -> UICollectionViewCell {
+    func collectionView(_ collectionView: UICollectionView, cellForItemAt indexPath: IndexPath) -> UICollectionViewCell {
         let cell = collectionView.dequeueReusableCell(
-            withReuseIdentifier: StickerCell.reuseIdentifier,
+            withReuseIdentifier: GiftCell.reuseIdentifier,
             for: indexPath
-        ) as! StickerCell
-        let silhouette: TGSStickerSilhouette? = silhouetteEnabled
-            ? .svgData(
-                Data(silhouetteSVG.utf8),
-                style: TGSStickerShimmerStyle(
-                    foregroundColor: UIColor(white: 0, alpha: 0.10),
-                    shimmeringColor: UIColor(white: 1, alpha: 0.55),
-                    duration: 1.3
-                )
-            )
-            : nil
-        let simulatedDelay: TimeInterval = silhouetteEnabled ? 1.5 : 0
-        cell.configure(
-            path: samplePath,
-            loader: animationLoader,
-            paused: isPaused,
-            silhouette: silhouette,
-            simulatedDelay: simulatedDelay
-        ) { [weak self] in
-            self?.frameCallbackCount += 1
-        }
+        ) as! GiftCell
+        cell.configure(sticker: stickers[indexPath.item])
         return cell
+    }
+
+    func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+        onSelectSticker?(stickers[indexPath.item])
     }
 
     func collectionView(
@@ -258,28 +257,91 @@ extension DemoViewController: UICollectionViewDataSource, UICollectionViewDelega
         layout collectionViewLayout: UICollectionViewLayout,
         sizeForItemAt indexPath: IndexPath
     ) -> CGSize {
-        itemSize()
+        let available = collectionView.bounds.width - layout.sectionInset.left - layout.sectionInset.right - (layout.minimumInteritemSpacing * 3)
+        let width = floor(available / 4)
+        return CGSize(width: max(68, width), height: 92)
     }
 }
 
-private final class StickerCell: UICollectionViewCell {
-    static let reuseIdentifier = "StickerCell"
+private final class GiftCell: UICollectionViewCell {
+    static let reuseIdentifier = "GiftCell"
 
-    private let playerView = TGSPlayerView()
+    private let previewView = TGSStickerShimmerEffectView()
+    private let nameLabel = UILabel()
+    private let typeLabel = UILabel()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        contentView.backgroundColor = UIColor(white: 0.92, alpha: 1.0)
+        contentView.backgroundColor = UIColor(white: 1, alpha: 0.08)
         contentView.layer.cornerRadius = 8
         contentView.layer.masksToBounds = true
-        playerView.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(playerView)
+
+        previewView.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(previewView)
+
+        nameLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        nameLabel.textColor = UIColor(white: 1, alpha: 0.88)
+        nameLabel.textAlignment = .center
+        nameLabel.adjustsFontSizeToFitWidth = true
+        nameLabel.minimumScaleFactor = 0.75
+        nameLabel.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(nameLabel)
+
+        typeLabel.font = .systemFont(ofSize: 9, weight: .bold)
+        typeLabel.textAlignment = .center
+        typeLabel.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(typeLabel)
+
         NSLayoutConstraint.activate([
-            playerView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            playerView.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            playerView.topAnchor.constraint(equalTo: contentView.topAnchor),
-            playerView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor)
+            previewView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 8),
+            previewView.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+            previewView.widthAnchor.constraint(equalToConstant: 52),
+            previewView.heightAnchor.constraint(equalToConstant: 52),
+            nameLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 4),
+            nameLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -4),
+            nameLabel.topAnchor.constraint(equalTo: previewView.bottomAnchor, constant: 6),
+            typeLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 4),
+            typeLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -4),
+            typeLabel.topAnchor.constraint(equalTo: nameLabel.bottomAnchor, constant: 2),
+            typeLabel.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -4)
         ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        previewView.stopAnimating()
+        previewView.setSilhouette(nil)
+    }
+
+    func configure(sticker: DemoSticker) {
+        nameLabel.text = sticker.stickerName
+        typeLabel.text = "TGS"
+        typeLabel.textColor = UIColor(red: 0.25, green: 0.70, blue: 1.0, alpha: 1)
+        previewView.setSilhouette(nil)
+        previewView.startAnimating()
+    }
+}
+
+private final class MessageCell: UITableViewCell {
+    static let reuseIdentifier = "MessageCell"
+
+    private let bubbleView = UIView()
+    private let titleLabel = UILabel()
+    private let subtitleLabel = UILabel()
+    private let playerView = TGSPlayerView()
+    private var source: TGSAnimatedStickerLocalFileSource?
+
+    override init(style: UITableViewCell.CellStyle, reuseIdentifier: String?) {
+        super.init(style: style, reuseIdentifier: reuseIdentifier)
+        selectionStyle = .none
+        backgroundColor = .clear
+        contentView.backgroundColor = .clear
+        configureSubviews()
     }
 
     @available(*, unavailable)
@@ -292,158 +354,98 @@ private final class StickerCell: UICollectionViewCell {
         playerView.frameUpdated = { _, _ in }
         playerView.silhouette = nil
         playerView.reset()
+        source = nil
     }
 
     func configure(
-        path: String,
+        message: DemoMessage,
         loader: TGSLottieAnimationLoading,
-        paused: Bool,
-        silhouette: TGSStickerSilhouette?,
-        simulatedDelay: TimeInterval,
         onFrame: @escaping () -> Void
     ) {
-        playerView.animationLoader = loader
-        playerView.frameUpdated = { _, _ in onFrame() }
-        playerView.silhouette = silhouette
-        let baseSource = TGSAnimatedStickerLocalFileSource(path: path)
-        let source: TGSAnimatedStickerSource = simulatedDelay > 0
-            ? DelayedAnimatedStickerSource(base: baseSource, delay: simulatedDelay)
-            : baseSource
-        playerView.setup(
-            source: source,
-            width: 96,
-            height: 96,
-            playbackMode: .loop,
-            mode: .direct(cachePathPrefix: nil)
-        )
-        playerView.overrideVisibility = true
-        playerView.visibility = !paused
-        playerView.autoplay = !paused
-    }
-
-    func setPaused(_ paused: Bool) {
-        playerView.visibility = !paused
-        playerView.autoplay = !paused
-    }
-}
-
-private final class DelayedAnimatedStickerSource: TGSAnimatedStickerSource {
-    let isVideo: Bool
-    private let base: TGSAnimatedStickerSource
-    private let delay: TimeInterval
-
-    init(base: TGSAnimatedStickerSource, delay: TimeInterval) {
-        self.base = base
-        self.delay = delay
-        self.isVideo = base.isVideo
-    }
-
-    func cachedDataPath(
-        width: Int,
-        height: Int,
-        completion: @escaping ((path: String, complete: Bool)?) -> Void
-    ) -> TGSCancellable {
-        return base.cachedDataPath(width: width, height: height, completion: completion)
-    }
-
-    func directDataPath(
-        attemptSynchronously: Bool,
-        completion: @escaping (String?) -> Void
-    ) -> TGSCancellable {
-        let token = DelayedCancellable()
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [base] in
-            guard !token.isCancelled else {
-                completion(nil)
-                return
-            }
-            let inner = base.directDataPath(
-                attemptSynchronously: attemptSynchronously,
-                completion: completion
+        switch message {
+        case let .system(text):
+            titleLabel.text = text
+            subtitleLabel.text = nil
+            playerView.isHidden = true
+            playerView.reset()
+        case let .gift(sticker):
+            titleLabel.text = "发送 \(sticker.stickerName).tgs"
+            subtitleLabel.text = "本地 TGS 文件 #\(sticker.id)"
+            playerView.isHidden = false
+            playerView.animationLoader = loader
+            playerView.frameUpdated = { _, _ in onFrame() }
+            playerView.silhouette = nil
+            let source = TGSAnimatedStickerLocalFileSource(path: sticker.playbackPath)
+            self.source = source
+            playerView.setup(
+                source: source,
+                width: 128,
+                height: 128,
+                playbackMode: .loop,
+                mode: .cached
             )
-            token.attach(inner)
+            playerView.overrideVisibility = true
+            playerView.visibility = true
+            playerView.autoplay = true
         }
-        return token
-    }
-}
-
-private final class DelayedCancellable: TGSCancellable {
-    private(set) var isCancelled: Bool = false
-    private var inner: TGSCancellable?
-
-    func attach(_ cancellable: TGSCancellable) {
-        if isCancelled {
-            cancellable.cancel()
-            return
-        }
-        inner = cancellable
     }
 
-    func cancel() {
-        isCancelled = true
-        inner?.cancel()
-        inner = nil
-    }
-}
+    private func configureSubviews() {
+        bubbleView.backgroundColor = UIColor(white: 1, alpha: 0.09)
+        bubbleView.layer.cornerRadius = 8
+        bubbleView.layer.masksToBounds = true
+        bubbleView.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(bubbleView)
 
-private final class PerformanceMetricsView: UIView {
-    private let titleLabel = UILabel()
-    private let fpsLabel = UILabel()
-    private let framesLabel = UILabel()
-    private let playersLabel = UILabel()
-    private let memoryLabel = UILabel()
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        backgroundColor = UIColor(white: 1.0, alpha: 0.08)
-        layer.cornerRadius = 8
-        layer.masksToBounds = true
-
-        titleLabel.text = "TGSPlayerKit rlottie stress"
-        titleLabel.font = .systemFont(ofSize: 17, weight: .bold)
+        titleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
         titleLabel.textColor = .white
+        titleLabel.numberOfLines = 0
 
-        let row = UIStackView(arrangedSubviews: [fpsLabel, framesLabel, playersLabel, memoryLabel])
+        subtitleLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        subtitleLabel.textColor = UIColor(white: 1, alpha: 0.62)
+
+        playerView.translatesAutoresizingMaskIntoConstraints = false
+        playerView.layer.cornerRadius = 8
+        playerView.layer.masksToBounds = true
+        playerView.backgroundColor = UIColor(white: 1, alpha: 0.06)
+
+        let textStack = UIStackView(arrangedSubviews: [titleLabel, subtitleLabel])
+        textStack.axis = .vertical
+        textStack.spacing = 4
+
+        let row = UIStackView(arrangedSubviews: [playerView, textStack])
         row.axis = .horizontal
-        row.spacing = 10
-        row.distribution = .fillEqually
-
-        let stack = UIStackView(arrangedSubviews: [titleLabel, row])
-        stack.axis = .vertical
-        stack.spacing = 8
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
+        row.spacing = 12
+        row.alignment = .center
+        row.translatesAutoresizingMaskIntoConstraints = false
+        bubbleView.addSubview(row)
 
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
-            stack.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10)
+            bubbleView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 6),
+            bubbleView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 16),
+            bubbleView.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -16),
+            bubbleView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -6),
+            row.topAnchor.constraint(equalTo: bubbleView.topAnchor, constant: 10),
+            row.leadingAnchor.constraint(equalTo: bubbleView.leadingAnchor, constant: 10),
+            row.trailingAnchor.constraint(equalTo: bubbleView.trailingAnchor, constant: -12),
+            row.bottomAnchor.constraint(equalTo: bubbleView.bottomAnchor, constant: -10),
+            playerView.widthAnchor.constraint(equalToConstant: 86),
+            playerView.heightAnchor.constraint(equalToConstant: 86)
         ])
+    }
+}
 
-        [fpsLabel, framesLabel, playersLabel, memoryLabel].forEach {
-            $0.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
-            $0.textColor = UIColor(white: 1.0, alpha: 0.86)
-            $0.adjustsFontSizeToFitWidth = true
-            $0.minimumScaleFactor = 0.72
-        }
-        update(fps: 0, framesPerSecond: 0, visiblePlayers: 0, totalPlayers: 0, memoryMB: 0)
+private final class RoomMessageListView: UITableView {
+    init() {
+        super.init(frame: .zero, style: .plain)
+        backgroundColor = UIColor(white: 1, alpha: 0.035)
+        layer.cornerRadius = 8
+        layer.masksToBounds = true
+        contentInset = UIEdgeInsets(top: 8, left: 0, bottom: 8, right: 0)
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         nil
-    }
-
-    func update(
-        fps: Double,
-        framesPerSecond: Int,
-        visiblePlayers: Int,
-        totalPlayers: Int,
-        memoryMB: Double
-    ) {
-        fpsLabel.text = String(format: "FPS %.1f", fps)
-        framesLabel.text = "\(framesPerSecond) frames/sec"
-        playersLabel.text = "\(visiblePlayers)/\(totalPlayers) visible"
-        memoryLabel.text = String(format: "%.0f MB", memoryMB)
     }
 }

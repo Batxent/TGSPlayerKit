@@ -10,3 +10,4 @@ DerivedData/
 Package.resolved
 NativeCore/Artifacts/
 Vendor/rlottie/
+Examples/TGSPlayerDemo/TGSPlayerDemo/Resources/tgs/*.tgs

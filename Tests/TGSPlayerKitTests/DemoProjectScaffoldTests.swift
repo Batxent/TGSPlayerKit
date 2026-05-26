@@ -1,25 +1,46 @@
 import XCTest
 
 final class DemoProjectScaffoldTests: XCTestCase {
-    func testDemoProjectUsesNativeRLottieBackendAndPerformanceHUD() throws {
+    func testDemoProjectUsesNativeRLottieBackendAndGiftMessageFlow() throws {
         let root = packageRoot()
         let project = root.appendingPathComponent("Examples/TGSPlayerDemo/TGSPlayerDemo.xcodeproj/project.pbxproj")
         let viewController = root.appendingPathComponent("Examples/TGSPlayerDemo/TGSPlayerDemo/DemoViewController.swift")
         let sample = root.appendingPathComponent("Examples/TGSPlayerDemo/TGSPlayerDemo/Resources/sample_pulse.json")
+        let tgsDirectory = root.appendingPathComponent("Examples/TGSPlayerDemo/TGSPlayerDemo/Resources/tgs")
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: project.path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: sample.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tgsDirectory.path))
 
         let projectText = try String(contentsOf: project)
         XCTAssertTrue(projectText.contains("TGSPlayerKit"))
         XCTAssertTrue(projectText.contains("TGSPlayerKitRLottieNative.xcframework"))
         XCTAssertTrue(projectText.contains("TGSRLottieAnimationLoader.swift"))
+        XCTAssertTrue(projectText.contains(".tgs in Resources"))
 
         let viewControllerText = try String(contentsOf: viewController)
-        XCTAssertTrue(viewControllerText.contains("CADisplayLink"))
+        XCTAssertTrue(viewControllerText.contains("UITableView"))
+        XCTAssertTrue(viewControllerText.contains("RoomMessageListView"))
+        XCTAssertTrue(viewControllerText.contains("messagesTitleLabel"))
+        XCTAssertTrue(viewControllerText.contains("GiftPanelView"))
+        XCTAssertTrue(viewControllerText.contains("sendSticker"))
+        XCTAssertTrue(viewControllerText.contains("Bundle.main.urls(forResourcesWithExtension: \"tgs\""))
+        XCTAssertTrue(viewControllerText.contains("TGSAnimatedStickerLocalFileSource"))
         XCTAssertTrue(viewControllerText.contains("TGSRLottieAnimationLoader"))
-        XCTAssertTrue(viewControllerText.contains("frames/sec"))
-        XCTAssertTrue(viewControllerText.contains("stressProfiles"))
+        XCTAssertFalse(viewControllerText.contains("DemoStickerCatalogPayload"))
+        XCTAssertFalse(viewControllerText.contains("RemoteAnimatedStickerSource"))
+    }
+
+    func testDemoGiftPanelUsesLocalTGSDirectory() throws {
+        let root = packageRoot()
+        let tgsDirectory = root.appendingPathComponent("Examples/TGSPlayerDemo/TGSPlayerDemo/Resources/tgs")
+        let filenames = try FileManager.default
+            .contentsOfDirectory(atPath: tgsDirectory.path)
+            .filter { $0.hasSuffix(".tgs") }
+
+        XCTAssertGreaterThanOrEqual(filenames.count, 50)
+        XCTAssertTrue(filenames.contains("55.tgs"))
+        XCTAssertTrue(filenames.contains("276.tgs"))
     }
 
     func testPlayerTimerRunsOffMainQueueForScrollingPlayback() throws {
