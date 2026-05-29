@@ -32,6 +32,7 @@ import os
 ///     the coordinator drains that slot at the head of the *next* vsync.
 internal final class TGSPlaybackCoordinator {
     internal static let shared = TGSPlaybackCoordinator()
+    private let defaultDisplayLinkFrameRate = 60
 
     /// One entry per registered view. Lifetime is owned by `entries`; the view also
     /// keeps a strong reference returned from `register(_:frameRate:)` so worker code
@@ -40,6 +41,8 @@ internal final class TGSPlaybackCoordinator {
         weak var view: TGSPlayerView?
         // Main-thread only.
         var frameInterval: CFTimeInterval
+        var targetFrameRate: Int
+        var displayLinkFrameRate: Int?
         var nextFireTimestamp: CFTimeInterval
         /// True between the moment we dispatch a render to the view's workQueue and the
         /// vsync at which we apply the resulting commit. Prevents tick pile-up when the
@@ -62,9 +65,16 @@ internal final class TGSPlaybackCoordinator {
             let generation: UInt64
         }
 
-        init(view: TGSPlayerView, frameInterval: CFTimeInterval) {
+        init(
+            view: TGSPlayerView,
+            frameInterval: CFTimeInterval,
+            targetFrameRate: Int,
+            displayLinkFrameRate: Int?
+        ) {
             self.view = view
             self.frameInterval = frameInterval
+            self.targetFrameRate = targetFrameRate
+            self.displayLinkFrameRate = displayLinkFrameRate
             self.nextFireTimestamp = 0
             self.inFlight = false
             self.pendingLock = UnsafeMutablePointer.allocate(capacity: 1)
@@ -106,23 +116,34 @@ internal final class TGSPlaybackCoordinator {
     /// Register `view` for vsync-driven playback. Returns the entry to be stored on the view;
     /// the view's worker uses it to publish rendered frames.
     @discardableResult
-    func register(_ view: TGSPlayerView, frameRate: Int) -> ViewEntry {
+    func register(_ view: TGSPlayerView, frameRate: Int, displayLinkFrameRate: Int? = nil) -> ViewEntry {
         dispatchPrecondition(condition: .onQueue(.main))
         let id = ObjectIdentifier(view)
-        let interval = 1.0 / Double(max(1, frameRate))
+        let targetFrameRate = normalizedFrameRate(frameRate)
+        let targetDisplayLinkFrameRate = displayLinkFrameRate.map(normalizedFrameRate)
+        let interval = 1.0 / Double(targetFrameRate)
         if let entry = entries[id] {
             // A previously paused view re-registering — refresh schedule without
             // creating a new entry so any in-flight worker still references a live entry.
             entry.frameInterval = interval
+            entry.targetFrameRate = targetFrameRate
+            entry.displayLinkFrameRate = targetDisplayLinkFrameRate
             entry.nextFireTimestamp = 0
             entry.inFlight = false
             ensureDisplayLinkRunning()
+            updateDisplayLinkFrameRate()
             TGSDebugLog("coordinator-reregister id=\(id) fps=\(frameRate) entries=\(entries.count)")
             return entry
         }
-        let entry = ViewEntry(view: view, frameInterval: interval)
+        let entry = ViewEntry(
+            view: view,
+            frameInterval: interval,
+            targetFrameRate: targetFrameRate,
+            displayLinkFrameRate: targetDisplayLinkFrameRate
+        )
         entries[id] = entry
         ensureDisplayLinkRunning()
+        updateDisplayLinkFrameRate()
         TGSDebugLog("coordinator-register id=\(id) fps=\(frameRate) entries=\(entries.count)")
         return entry
     }
@@ -137,6 +158,8 @@ internal final class TGSPlaybackCoordinator {
         if entries.isEmpty {
             displayLink?.isPaused = true
             allInFlightSince = nil
+        } else {
+            updateDisplayLinkFrameRate()
         }
     }
 
@@ -145,22 +168,33 @@ internal final class TGSPlaybackCoordinator {
     private func ensureDisplayLinkRunning() {
         if displayLink == nil {
             let link = CADisplayLink(target: self, selector: #selector(handleVsync(_:)))
-            if #available(iOS 15.0, *) {
-                // Track the display's preferred refresh range — on a 120Hz ProMotion
-                // device we'll tick at 120Hz, on a low-power Mac at 60Hz, and we can
-                // gracefully fall back to 30Hz under thermal pressure.
-                link.preferredFrameRateRange = CAFrameRateRange(
-                    minimum: 30,
-                    maximum: 120,
-                    preferred: 60
-                )
-            } else {
-                link.preferredFramesPerSecond = 60
-            }
             link.add(to: .main, forMode: .common)
             displayLink = link
         }
         displayLink?.isPaused = false
+    }
+
+    private func updateDisplayLinkFrameRate() {
+        guard let displayLink else { return }
+        let targetFrameRate = entries.values
+            .map { entry in
+                entry.displayLinkFrameRate ?? max(defaultDisplayLinkFrameRate, entry.targetFrameRate)
+            }
+            .max() ?? defaultDisplayLinkFrameRate
+        if #available(iOS 15.0, *) {
+            displayLink.preferredFrameRateRange = CAFrameRateRange(
+                minimum: Float(targetFrameRate),
+                maximum: Float(targetFrameRate),
+                preferred: Float(targetFrameRate)
+            )
+        } else {
+            displayLink.preferredFramesPerSecond = targetFrameRate
+        }
+        TGSDebugLog("coordinator-displaylink-fps fps=\(targetFrameRate) entries=\(entries.count)")
+    }
+
+    private func normalizedFrameRate(_ frameRate: Int) -> Int {
+        max(1, min(frameRate, 120))
     }
 
     @objc private func handleVsync(_ link: CADisplayLink) {

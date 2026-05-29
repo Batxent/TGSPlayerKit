@@ -90,6 +90,71 @@ final class DemoProjectScaffoldTests: XCTestCase {
         )
     }
 
+    func testCoordinatorKeepsOriginalDefaultDisplayLinkFrameRate() throws {
+        let root = packageRoot()
+        let coordinator = root.appendingPathComponent("Sources/TGSPlayerKit/TGSPlaybackCoordinator.swift")
+        let coordinatorText = try String(contentsOf: coordinator)
+
+        XCTAssertTrue(
+            coordinatorText.contains("targetFrameRate"),
+            "Coordinator entries must remember the sticker FPS they were registered with"
+        )
+        XCTAssertTrue(
+            coordinatorText.contains("updateDisplayLinkFrameRate()"),
+            "Coordinator must refresh the global CADisplayLink FPS when active sticker FPS changes"
+        )
+        XCTAssertTrue(
+            coordinatorText.contains("private let defaultDisplayLinkFrameRate = 60"),
+            "The display link must keep the previous 60fps default"
+        )
+        XCTAssertTrue(
+            coordinatorText.contains("entry.displayLinkFrameRate ?? max(defaultDisplayLinkFrameRate, entry.targetFrameRate)"),
+            "Active sticker FPS below the default must not lower CADisplayLink FPS implicitly"
+        )
+        XCTAssertTrue(
+            coordinatorText.contains("displayLink.preferredFrameRateRange = CAFrameRateRange(")
+                && coordinatorText.contains("minimum: Float(targetFrameRate)")
+                && coordinatorText.contains("maximum: Float(targetFrameRate)")
+                && coordinatorText.contains("preferred: Float(targetFrameRate)"),
+            "On iOS 15+, the display link should request the target FPS directly instead of a fixed 60/120Hz range"
+        )
+        XCTAssertTrue(
+            coordinatorText.contains("displayLink.preferredFramesPerSecond = targetFrameRate"),
+            "Before iOS 15, the display link should still request the target FPS through preferredFramesPerSecond"
+        )
+    }
+
+    func testExplicitPlaybackFrameRateCanLowerDisplayLinkWithoutSlowingAnimation() throws {
+        let root = packageRoot()
+        let playerView = root.appendingPathComponent("Sources/TGSPlayerKit/TGSPlayerView.swift")
+        let coordinator = root.appendingPathComponent("Sources/TGSPlayerKit/TGSPlaybackCoordinator.swift")
+
+        let playerViewText = try String(contentsOf: playerView)
+        let coordinatorText = try String(contentsOf: coordinator)
+
+        XCTAssertTrue(
+            playerViewText.contains("public var preferredPlaybackFrameRate: Int?"),
+            "PlayerView needs a public explicit target FPS for integrators to lower TGS playback on low-end devices"
+        )
+        XCTAssertTrue(
+            playerViewText.contains("displayLinkFrameRate: self.preferredPlaybackFrameRate"),
+            "Explicit playback FPS must be passed to the coordinator as an explicit CADisplayLink target"
+        )
+        XCTAssertTrue(
+            playerViewText.contains("playbackDisplayFrameIndex")
+                && playerViewText.contains("reducedPlaybackSourceFrameIndex"),
+            "Reduced FPS playback must map display ticks back to source frame indexes instead of slowing the animation"
+        )
+        XCTAssertTrue(
+            coordinatorText.contains("displayLinkFrameRate: Int? = nil"),
+            "Coordinator registration must distinguish default display link FPS from an explicit low-FPS request"
+        )
+        XCTAssertTrue(
+            coordinatorText.contains("entry.displayLinkFrameRate ?? max(defaultDisplayLinkFrameRate, entry.targetFrameRate)"),
+            "Only explicit low-FPS requests should lower the global display link below the original default"
+        )
+    }
+
     private func packageRoot() -> URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

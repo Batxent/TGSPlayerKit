@@ -19,6 +19,7 @@ public final class TGSPlayerView: UIView {
     public var automaticallyLoadLastFrame: Bool = false
     public var playToCompletionOnStop: Bool = false
     public var stopAtNearestLoop: Bool = false
+    public var preferredPlaybackFrameRate: Int?
 
     public var started: () -> Void = {}
     public var completed: (Bool) -> Void = { _ in }
@@ -139,6 +140,9 @@ public final class TGSPlayerView: UIView {
     ///      operations on a single instance.
     private var frameSource: TGSAnimatedStickerFrameSource?
     private var frameQueue: TGSAnimatedStickerFrameQueue?
+    private var playbackSourceFrameRate: Int = 0
+    private var playbackTargetFrameRate: Int = 0
+    private var playbackDisplayFrameIndex: Int = 0
 
     // MARK: - Coordinator wiring (main thread)
     /// When this view is actively driving playback, it's registered with
@@ -518,6 +522,9 @@ public final class TGSPlayerView: UIView {
             guard let self else { return }
             self.frameSource = nil
             self.frameQueue = nil
+            self.playbackSourceFrameRate = 0
+            self.playbackTargetFrameRate = 0
+            self.playbackDisplayFrameIndex = 0
         }
     }
 
@@ -690,8 +697,12 @@ public final class TGSPlayerView: UIView {
 
         // Render the very first frame eagerly so the cell shows content without waiting
         // for the next vsync. The coordinator picks it up from there.
+        let sourceFrameRate = frameSource.frameRate
+        let playbackFrameRate = resolvedPlaybackFrameRate(sourceFrameRate: sourceFrameRate)
+        playbackSourceFrameRate = sourceFrameRate
+        playbackTargetFrameRate = playbackFrameRate
+        playbackDisplayFrameIndex = 0
         let firstCommit = makeCommitOnWorkQueue(skipFrames: 0, generation: generation)
-        let frameRate = frameSource.frameRate
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -707,9 +718,10 @@ public final class TGSPlayerView: UIView {
             // driven by the global CADisplayLink and committed in a batched CATransaction.
             self.coordinatorEntry = TGSPlaybackCoordinator.shared.register(
                 self,
-                frameRate: frameRate
+                frameRate: playbackFrameRate,
+                displayLinkFrameRate: self.preferredPlaybackFrameRate
             )
-            TGSDebugLog("player-coordinator-registered id=\(self.debugID) fps=\(frameRate)")
+            TGSDebugLog("player-coordinator-registered id=\(self.debugID) fps=\(playbackFrameRate) sourceFps=\(sourceFrameRate)")
         }
     }
 
@@ -798,6 +810,22 @@ public final class TGSPlayerView: UIView {
         generation: UInt64
     ) -> TGSPlaybackCoordinator.ViewEntry.PendingCommit? {
         guard let frameQueue else { return nil }
+        if usesReducedPlaybackFrameRate, let frameSource {
+            playbackDisplayFrameIndex += skipFrames
+            let sourceFrameIndex = reducedPlaybackSourceFrameIndex(frameCount: frameSource.frameCount)
+            frameSource.skipToFrameIndex(sourceFrameIndex)
+            guard let frame = frameSource.takeFrame(draw: true) else { return nil }
+            playbackDisplayFrameIndex += 1
+
+            return TGSPlaybackCoordinator.ViewEntry.PendingCommit(
+                cgImage: Self.makeCGImage(from: frame),
+                frameIndex: frame.index,
+                totalFrames: frame.totalFrames,
+                isLast: frame.isLastFrame,
+                frameRate: frameSource.frameRate,
+                generation: generation
+            )
+        }
         if skipFrames > 0, let frameSource {
             // Drain skipped frames cheaply (no rlottie render, no CGImage creation).
             for _ in 0..<skipFrames {
@@ -816,6 +844,36 @@ public final class TGSPlayerView: UIView {
             frameRate: frameSource?.frameRate ?? 0,
             generation: generation
         )
+    }
+
+    private var usesReducedPlaybackFrameRate: Bool {
+        playbackTargetFrameRate > 0 && playbackSourceFrameRate > playbackTargetFrameRate
+    }
+
+    private func resolvedPlaybackFrameRate(sourceFrameRate: Int) -> Int {
+        guard let preferredPlaybackFrameRate, preferredPlaybackFrameRate > 0 else {
+            return max(1, sourceFrameRate)
+        }
+        return max(1, min(preferredPlaybackFrameRate, sourceFrameRate))
+    }
+
+    private func reducedPlaybackSourceFrameIndex(frameCount: Int) -> Int {
+        guard frameCount > 0, playbackTargetFrameRate > 0 else {
+            return 0
+        }
+        let rawIndex = Int(
+            (
+                Double(playbackDisplayFrameIndex)
+                    * Double(playbackSourceFrameRate)
+                    / Double(playbackTargetFrameRate)
+            ).rounded(.down)
+        )
+        switch playbackMode {
+        case .loop:
+            return rawIndex % frameCount
+        case .once, .still, .count:
+            return min(rawIndex, frameCount - 1)
+        }
     }
 
     /// `workQueue` only.
